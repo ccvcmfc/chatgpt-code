@@ -40,19 +40,22 @@ bool renderPdmapScanLine(
 
     const int width = image.width();
     const int height = image.height();
-    const double scale = std::min(width / regionOrg.width(),
-                                  height / regionOrg.height());
-    const double pixelSize = 1.0 / scale;
-    const double physicalLeft =
-        regionOrg.center().x() - width * pixelSize * 0.5;
-    const double physicalBottom =
-        regionOrg.center().y() - height * pixelSize * 0.5;
-    const double physicalTop =
-        physicalBottom + height * pixelSize;
-
     // Window lower-left is xMin/yMin. The cell is at the window center.
     const double cellLeft = xMin + windowX * 0.5;
     const double cellBottom = yMin + windowY * 0.5;
+
+    // Fit the step-cell data footprint rather than the larger region.
+    const double dataWidth = nx * stepX;
+    const double dataHeight = ny * stepY;
+    const double scale = std::min(width / dataWidth,
+                                  height / dataHeight);
+    const double pixelSize = 1.0 / scale;
+    const double physicalLeft =
+        cellLeft + dataWidth * 0.5 - width * pixelSize * 0.5;
+    const double physicalBottom =
+        cellBottom + dataHeight * 0.5 - height * pixelSize * 0.5;
+    const double physicalTop =
+        physicalBottom + height * pixelSize;
 
     image.fill(Qt::transparent);
     for (int py = 0; py < height; ++py)
