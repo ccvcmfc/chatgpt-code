@@ -1,5 +1,7 @@
 // candy.cpp - standalone Qt 5.9 / C++11 PDMAP step-cell renderer
 // Experimental point-sampling preview, not an exact QPainter rasterization match.
+// Original region controls display; expanded region selects candidate indices.
+// Sampling cannot recover pixels outside the actual step-cell footprint.
 // Each density belongs to a step-sized rectangle located at its window center.
 #include <QImage>
 #include <QRectF>
@@ -40,20 +42,46 @@ bool renderPdmapScanLine(
 
     const int width = image.width();
     const int height = image.height();
-    // Window lower-left is xMin/yMin. The cell is at the window center.
-    const double cellLeft = xMin + windowX * 0.5;
-    const double cellBottom = yMin + windowY * 0.5;
+    // A step-sized rectangle is moved to each window's center.
+    const double offsetX = (windowX - stepX) * 0.5;
+    const double offsetY = (windowY - stepY) * 0.5;
+    const double cellLeft = xMin + offsetX;
+    const double cellBottom = yMin + offsetY;
 
-    // Fit the step-cell data footprint rather than the larger region.
-    const double dataWidth = nx * stepX;
-    const double dataHeight = ny * stepY;
-    const double scale = std::min(width / dataWidth,
-                                  height / dataHeight);
+    // Expand the requested image region only for density index selection.
+    const QRectF region = regionOrg.adjusted(
+        -offsetX, -offsetY, offsetX, offsetY);
+    const QRectF densityRegion(
+        xMin, yMin, (nx - 1) * stepX + windowX,
+                    (ny - 1) * stepY + windowY);
+    const QRectF intersection = region.intersected(densityRegion);
+    if (intersection.isEmpty())
+    {
+        image.fill(Qt::transparent);
+        return true;
+    }
+
+    const qint64 xIndexBegin = std::max<qint64>(0,
+        static_cast<qint64>(std::floor(
+            (intersection.left() - xMin) / stepX)));
+    const qint64 yIndexBegin = std::max<qint64>(0,
+        static_cast<qint64>(std::floor(
+            (intersection.top() - yMin) / stepY)));
+    const qint64 xIndexEnd = std::min<qint64>(nx,
+        static_cast<qint64>(std::ceil(
+            (intersection.right() - xMin) / stepX)) + 1);
+    const qint64 yIndexEnd = std::min<qint64>(ny,
+        static_cast<qint64>(std::ceil(
+            (intersection.bottom() - yMin) / stepY)) + 1);
+
+    // Image coordinates must always use the ORIGINAL region.
+    const double scale = std::min(width / regionOrg.width(),
+                                  height / regionOrg.height());
     const double pixelSize = 1.0 / scale;
     const double physicalLeft =
-        cellLeft + dataWidth * 0.5 - width * pixelSize * 0.5;
+        regionOrg.center().x() - width * pixelSize * 0.5;
     const double physicalBottom =
-        cellBottom + dataHeight * 0.5 - height * pixelSize * 0.5;
+        regionOrg.center().y() - height * pixelSize * 0.5;
     const double physicalTop =
         physicalBottom + height * pixelSize;
 
@@ -64,7 +92,7 @@ bool renderPdmapScanLine(
             physicalTop - (py + 0.5) * pixelSize;
         const qint64 iy = static_cast<qint64>(
             std::floor((physicalY - cellBottom) / stepY));
-        if (iy < 0 || iy >= ny)
+        if (iy < yIndexBegin || iy >= yIndexEnd)
             continue;
 
         QRgb* line = reinterpret_cast<QRgb*>(image.scanLine(py));
@@ -76,7 +104,7 @@ bool renderPdmapScanLine(
                 physicalLeft + (px + 0.5) * pixelSize;
             const qint64 ix = static_cast<qint64>(
                 std::floor((physicalX - cellLeft) / stepX));
-            if (ix < 0 || ix >= nx)
+            if (ix < xIndexBegin || ix >= xIndexEnd)
                 continue;
 
             const double density =
