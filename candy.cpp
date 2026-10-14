@@ -1,180 +1,133 @@
 // candy.cpp
-// Qt 5.9 / C++11 standalone experiment: MaxColorIndex vs AverageDensity.
-// Synthetic data only. Does not modify production scanline rendering.
-// Build: g++ -std=c++11 -fPIC candy.cpp -o candy $(pkg-config --cflags --libs Qt5Core Qt5Gui)
-// Run: ./candy
+// Qt 5.9 / C++11 standalone FULL-IMAGE area-weighted ColorIndex average.
+// Synthetic input only. Replace colorIndexAt() and palette() with real data.
+// Build: g++ -O3 -std=c++11 -fPIC candy.cpp -o candy $(pkg-config --cflags --libs Qt5Core Qt5Gui)
+// Run: ./candy [nx ny imageWidth imageHeight]
+// Examples: ./candy 600 240 60 24
+//           ./candy 66667 22500 992 336
+//
+// Important: This reproduces the tested ColorIndex average, NOT a raw-density
+// average, and is NOT pixel-identical to QPainter's grouped flush rendering.
+// Runtime is O(nx*ny) in the general case; 1.5B cells may take substantial time.
+// Output uses a fixed-size QImage; no 1.5B-cell array is allocated.
+
 #include <QCoreApplication>
 #include <QImage>
-#include <QPainter>
-#include <QRectF>
-#include <QTransform>
 #include <QColor>
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QtGlobal>
-#include <vector>
-#include <cmath>
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <limits>
 
-static const int NX = 600;
-static const int NY = 240;
-static const int W = 60;
-static const int H = 24;
 static const int COLORS = 11;
-static const int LIMIT = 1024 * 1024;
-static const double STEP = 0.06;
 
+// Replace with the actual palette lookup. Index order must match production.
 static QRgb palette(int i)
 {
-    static const QRgb c[COLORS] = {
+    static const QRgb colors[COLORS] = {
         qRgb(20,25,55), qRgb(42,100,190), qRgb(32,175,125),
         qRgb(245,195,60), qRgb(220,85,70), qRgb(150,80,195),
         qRgb(235,235,235), qRgb(75,170,210), qRgb(180,135,60),
         qRgb(85,90,100), qRgb(240,115,175)
     };
-    return c[i];
+    return colors[i];
 }
 
-static int densityIndex(int x, int y)
+// Replace with your real matrix/palette-index accessor.
+// x in [0,nx), y in [0,ny). No production data is included.
+static int colorIndexAt(int x, int y)
 {
-    // Deterministic synthetic spatial pattern.
     const int band = (x / 17 + y / 11) % COLORS;
-    const int detail = ((x * 13 + y * 7) % 19 == 0) ? 3 : 0;
+    const int detail = ((x * 13LL + y * 7LL) % 19 == 0) ? 3 : 0;
     return (band + detail) % COLORS;
 }
 
-static QTransform makeTransform()
+// Each output pixel covers a continuous rectangle in input cell coordinates.
+// This is an exact area-weighted mean of COLOR INDICES for axis-aligned,
+// uniformly spaced cells. Output uses the nearest palette index.
+// Image origin follows Qt (top-left); adapt y mapping if input is bottom-up.
+static QImage renderAverageColorIndex(int nx, int ny, int width, int height)
 {
-    QTransform t;
-    t.scale(double(W) / (NX * STEP), double(H) / (NY * STEP));
-    return t;
-}
+    QImage result(width, height, QImage::Format_ARGB32);
+    if (result.isNull()) return result;
+    result.fill(Qt::transparent);
 
-static QImage painterReference()
-{
-    QImage image(W, H, QImage::Format_ARGB32);
-    image.fill(Qt::transparent);
-    QPainter painter(&image);
-    painter.setPen(Qt::NoPen);
-    painter.setRenderHint(QPainter::Antialiasing, false);
-    painter.setTransform(makeTransform());
-    std::vector<QRectF> batches[COLORS];
-    int pending = 0;
-    const auto flush = [&]() {
-        for (int c = 0; c < COLORS; ++c) {
-            if (!batches[c].empty()) {
-                painter.setBrush(QColor::fromRgb(palette(c)));
-                painter.drawRects(batches[c].data(), static_cast<int>(batches[c].size()));
-                batches[c].clear();
-            }
-        }
-        pending = 0;
-    };
-    // Bottom to top, then left to right, as described for AS-IS.
-    for (int y = NY - 1; y >= 0; --y) {
-        for (int x = 0; x < NX; ++x) {
-            if (pending >= LIMIT - 4) flush();
-            const int c = densityIndex(x, y);
-            batches[c].push_back(QRectF(x * STEP, y * STEP, STEP, STEP));
-            ++pending;
-        }
-    }
-    flush();
-    painter.end();
-    return image;
-}
+    const double sx = double(nx) / width;
+    const double sy = double(ny) / height;
 
-static QImage aggregate(bool useMaximum)
-{
-    QImage image(W, H, QImage::Format_ARGB32);
-    image.fill(Qt::transparent);
-    bool ok = false;
-    const QTransform inverse = makeTransform().inverted(&ok);
-    if (!ok) return image;
+    for (int py = 0; py < height; ++py) {
+        QRgb *dst = reinterpret_cast<QRgb *>(result.scanLine(py));
+        const double top = py * sy;
+        const double bottom = (py + 1.0) * sy;
+        const int y0 = std::max(0, int(std::floor(top)));
+        const int y1 = std::min(ny - 1, int(std::ceil(bottom)) - 1);
 
-    for (int py = 0; py < H; ++py) {
-        QRgb *line = reinterpret_cast<QRgb*>(image.scanLine(py));
-        for (int px = 0; px < W; ++px) {
-            // Pixel footprint in matrix coordinates, axis-aligned transform.
-            const QPointF a = inverse.map(QPointF(px, py));
-            const QPointF b = inverse.map(QPointF(px + 1.0, py + 1.0));
-            const double xmin = std::min(a.x(), b.x());
-            const double xmax = std::max(a.x(), b.x());
-            const double ymin = std::min(a.y(), b.y());
-            const double ymax = std::max(a.y(), b.y());
-            const int x0 = std::max(0, static_cast<int>(std::floor(xmin / STEP)) - 1);
-            const int x1 = std::min(NX - 1, static_cast<int>(std::ceil(xmax / STEP)));
-            const int y0 = std::max(0, static_cast<int>(std::floor(ymin / STEP)) - 1);
-            const int y1 = std::min(NY - 1, static_cast<int>(std::ceil(ymax / STEP)));
-            int maximum = 0;
-            double weightedSum = 0.0;
-            double weightTotal = 0.0;
-            for (int iy = y0; iy <= y1; ++iy) {
-                const double sy0 = iy * STEP, sy1 = sy0 + STEP;
-                const double overlapY = std::max(0.0, std::min(ymax, sy1) - std::max(ymin, sy0));
-                if (overlapY <= 0.0) continue;
-                for (int ix = x0; ix <= x1; ++ix) {
-                    const double sx0 = ix * STEP, sx1 = sx0 + STEP;
-                    const double overlapX = std::max(0.0, std::min(xmax, sx1) - std::max(xmin, sx0));
-                    const double weight = overlapX * overlapY;
+        for (int px = 0; px < width; ++px) {
+            const double left = px * sx;
+            const double right = (px + 1.0) * sx;
+            const int x0 = std::max(0, int(std::floor(left)));
+            const int x1 = std::min(nx - 1, int(std::ceil(right)) - 1);
+            double weighted = 0.0;
+            double total = 0.0;
+
+            for (int y = y0; y <= y1; ++y) {
+                const double wy = std::max(0.0,
+                    std::min(bottom, double(y + 1)) - std::max(top, double(y)));
+                if (wy <= 0.0) continue;
+                for (int x = x0; x <= x1; ++x) {
+                    const double wx = std::max(0.0,
+                        std::min(right, double(x + 1)) - std::max(left, double(x)));
+                    const double weight = wx * wy;
                     if (weight <= 0.0) continue;
-                    const int c = densityIndex(ix, iy);
-                    maximum = std::max(maximum, c);
-                    weightedSum += c * weight;
-                    weightTotal += weight;
+                    const int idx = colorIndexAt(x, y);
+                    if (idx < 0 || idx >= COLORS) continue; // missing cell
+                    weighted += weight * idx;
+                    total += weight;
                 }
             }
-            if (weightTotal > 0.0) {
-                const int result = useMaximum ? maximum :
-                    std::max(0, std::min(COLORS - 1,
-                        static_cast<int>(std::floor(weightedSum / weightTotal + 0.5))));
-                line[px] = palette(result);
+
+            if (total > 0.0) {
+                const int index = std::max(0, std::min(COLORS - 1,
+                    int(std::floor(weighted / total + 0.5))));
+                dst[px] = palette(index);
             }
         }
+        if ((py + 1) % 32 == 0 || py + 1 == height)
+            qDebug() << "rows:" << (py + 1) << "/" << height;
     }
-    return image;
+    return result;
 }
 
-static void compare(const char *name, const QImage &ref, const QImage &test)
+static int positiveArg(char *s, int fallback)
 {
-    quint64 match = 0, mismatch = 0, refTransparent = 0;
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            const QRgb a = ref.pixel(x, y);
-            const QRgb b = test.pixel(x, y);
-            if (qAlpha(a) == 0) ++refTransparent;
-            if (a == b) ++match; else ++mismatch;
-        }
-    }
-    qDebug() << name << "match:" << match << "mismatch:" << mismatch
-             << "match rate:" << (100.0 * match / (match + mismatch))
-             << "% reference transparent:" << refTransparent;
+    if (!s) return fallback;
+    char *end = nullptr;
+    const long v = std::strtol(s, &end, 10);
+    if (end == s || *end != '\0' || v <= 0 ||
+        v > std::numeric_limits<int>::max()) return fallback;
+    return static_cast<int>(v);
 }
 
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
+    const int nx = argc > 1 ? positiveArg(argv[1], 600) : 600;
+    const int ny = argc > 2 ? positiveArg(argv[2], 240) : 240;
+    const int w = argc > 3 ? positiveArg(argv[3], 60) : 60;
+    const int h = argc > 4 ? positiveArg(argv[4], 24) : 24;
+
+    qDebug() << "Input matrix:" << nx << "x" << ny
+             << "Output image:" << w << "x" << h;
     QElapsedTimer timer;
     timer.start();
-    const QImage ref = painterReference();
-    qDebug() << "Painter ms:" << timer.elapsed();
-    ref.save("candy_painter.png");
-
-    timer.restart();
-    const QImage maxImage = aggregate(true);
-    qDebug() << "MaxColorIndex ms:" << timer.elapsed();
-    maxImage.save("candy_max_color.png");
-    compare("MaxColorIndex", ref, maxImage);
-
-    timer.restart();
-    const QImage avgImage = aggregate(false);
-    qDebug() << "AverageDensity ms:" << timer.elapsed();
-    avgImage.save("candy_average.png");
-    compare("AverageDensity", ref, avgImage);
-
-    qDebug() << "Synthetic example:" << NX << "x" << NY
-             << "matrix ->" << W << "x" << H << "image.";
-    qDebug() << "NOTE: Flush-aware painter is the reference; Max/Average"
-                " are approximations. Adapt region/transform/data for production.";
+    const QImage image = renderAverageColorIndex(nx, ny, w, h);
+    if (image.isNull() || !image.save("candy_average_full.png")) {
+        qCritical() << "Failed to generate/save output image";
+        return 1;
+    }
+    qDebug() << "Saved candy_average_full.png; elapsed ms:" << timer.elapsed();
     return 0;
 }
