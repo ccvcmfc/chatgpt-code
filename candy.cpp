@@ -1,178 +1,134 @@
 // candy.cpp
-// PDMAP Scanline sampling alternatives (Qt 5.9 / C++11).
-// Integration snippet: insert into existing rendering function.
-// Required existing variables:
-//   QImage image (Format_ARGB32), std::vector<double> values,
-//   int nx, ny; double stepX, stepY, startX, startY;
-//   QTransform painterTransform; QRgb colors[11];
-//   int getDensityColorIndex(double density);
-// startX/startY = first stepRect's left/top after moveCenter(windowRect.center()).
-// IMPORTANT: Use the EXACT transform used by the existing QPainter renderer.
-// This snippet assumes an opaque 11-color palette. No rotations/reflections needed.
-//
-// SampleMode::LastCell is only a hypothesis for approximating drawRects().
-// Majority4x4 is a distribution-oriented alternative, NOT pixel-exact QPainter.
-// Run each mode against its OWN dataset's drawRects() reference image.
-
+// Qt 5.9 / C++11: identify the LAST QRectF cell written by QPainter.
+// Standalone diagnostic. No proprietary data.
+// Build: g++ -std=c++11 -fPIC candy.cpp -o candy $(pkg-config --cflags --libs Qt5Gui Qt5Core)
+// Run: ./candy
+#include <QCoreApplication>
 #include <QImage>
+#include <QPainter>
 #include <QTransform>
-#include <QPointF>
-#include <QElapsedTimer>
+#include <QRectF>
+#include <QVector>
+#include <QColor>
 #include <QDebug>
-#include <QRgb>
-#include <algorithm>
+#include <QtGlobal>
 #include <cmath>
-#include <cstddef>
-#include <vector>
+#include <algorithm>
 
-enum class SampleMode
+static QRgb encodeId(int id)
 {
-    Center,
-    LastCell,
-    Majority4x4
-};
-
-// Paste this function into the existing renderer and connect the actual
-// getDensityColorIndex() function through the callback.
-// Returns false if the inputs cannot be rendered safely.
-template <typename ColorIndexFn>
-bool renderPdmapSampling(
-    QImage &image,
-    const std::vector<double> &values,
-    int nx, int ny,
-    double stepX, double stepY,
-    double startX, double startY,
-    const QTransform &painterTransform,
-    const QRgb (&colors)[11],
-    ColorIndexFn getDensityColorIndex,
-    SampleMode mode)
+    // ID 0 is reserved for untouched pixels (black).
+    return qRgb(id & 255, (id >> 8) & 255, (id >> 16) & 255);
+}
+static int decodeId(QRgb rgb)
 {
-    if (image.format() != QImage::Format_ARGB32 ||
-        image.width() <= 0 || image.height() <= 0 ||
-        nx <= 0 || ny <= 0 ||
-        !(stepX > 0.0) || !(stepY > 0.0) ||
-        !std::isfinite(startX) || !std::isfinite(startY))
-        return false;
+    return qRed(rgb) | (qGreen(rgb) << 8) | (qBlue(rgb) << 16);
+}
+static int clampIndex(int i, int n)
+{
+    return std::max(0, std::min(n - 1, i));
+}
+static int centerIndex(double coordinate, double step, int n)
+{
+    return clampIndex(static_cast<int>(std::floor(coordinate / step)), n);
+}
 
-    const size_t sx = static_cast<size_t>(nx);
-    const size_t sy = static_cast<size_t>(ny);
-    if (sx > values.size() / sy)
-        return false;
+int main(int argc, char **argv)
+{
+    QCoreApplication app(argc, argv);
+
+    const int nx = 600;
+    const int ny = 240;
+    const double windowX = 0.06, windowY = 0.06;
+    const double stepX = 0.06, stepY = 0.06;
+    const QSize imageSize(60, 24);
+
+    // Replace with the EXACT production transform for a second test.
+    QTransform transform;
+    transform.scale(double(imageSize.width()) / (nx * stepX),
+                    double(imageSize.height()) / (ny * stepY));
+
+    QImage baseline(imageSize, QImage::Format_ARGB32);
+    baseline.fill(qRgb(0, 0, 0)); // ID=0 means untouched
+
+    QPainter painter(&baseline);
+    painter.setRenderHint(QPainter::Antialiasing, false);
+    painter.setPen(Qt::NoPen);
+    painter.setTransform(transform);
+
+    // Preserve row-major draw order, ix increasing first.
+    // Consecutive same-color rectangles can be batched; unique IDs
+    // mean each cell must have its own brush and draw call.
+    for (int iy = 0; iy < ny; ++iy) {
+        for (int ix = 0; ix < nx; ++ix) {
+            const int id = iy * nx + ix + 1;
+            const double x = ix * stepX, y = iy * stepY;
+            QRectF windowRect(x, y, windowX, windowY);
+            QRectF stepRect(x, y, stepX, stepY);
+            stepRect.moveCenter(windowRect.center());
+            painter.setBrush(QColor::fromRgb(encodeId(id)));
+            painter.drawRect(stepRect);
+        }
+    }
+    painter.end();
 
     bool invertible = false;
-    const QTransform inverseTransform =
-        painterTransform.inverted(&invertible);
-    if (!invertible)
-        return false;
+    const QTransform inverse = transform.inverted(&invertible);
+    if (!invertible) {
+        qWarning() << "Non-invertible transform";
+        return 1;
+    }
 
-    auto sampleColor = [&](int px, int py,
-                           double offsetX, double offsetY) -> int
-    {
-        const QPointF world = inverseTransform.map(
-            QPointF(px + offsetX, py + offsetY));
+    const double firstX = (windowX - stepX) * 0.5;
+    const double firstY = (windowY - stepY) * 0.5;
+    int untouched = 0, matched = 0, mismatched = 0;
+    int minDx = nx, maxDx = -nx, minDy = ny, maxDy = -ny;
+    int shown = 0;
 
-        // Clamp also reproduces border extension ONLY when that is how
-        // the original renderer treats out-of-matrix coordinates.
-        const double fx = std::floor((world.x() - startX) / stepX);
-        const double fy = std::floor((world.y() - startY) / stepY);
-        if (!std::isfinite(fx) || !std::isfinite(fy))
-            return -1;
-
-        const int ix = fx < 0.0 ? 0 :
-            fx >= static_cast<double>(nx) ? nx - 1 :
-            static_cast<int>(fx);
-        const int iy = fy < 0.0 ? 0 :
-            fy >= static_cast<double>(ny) ? ny - 1 :
-            static_cast<int>(fy);
-
-        const size_t index = static_cast<size_t>(iy) * sx +
-                             static_cast<size_t>(ix);
-        const int colorIndex = getDensityColorIndex(values[index]);
-        return (colorIndex >= 0 && colorIndex < 11) ? colorIndex : -1;
-    };
-
-    QElapsedTimer timer;
-    timer.start();
-
-    for (int py = 0; py < image.height(); ++py)
-    {
-        QRgb *line = reinterpret_cast<QRgb *>(image.scanLine(py));
-
-        for (int px = 0; px < image.width(); ++px)
-        {
-            int colorIndex = -1;
-
-            if (mode == SampleMode::Center)
-            {
-                colorIndex = sampleColor(px, py, 0.5, 0.5);
+    for (int py = 0; py < imageSize.height(); ++py) {
+        const QRgb *line = reinterpret_cast<const QRgb *>(baseline.constScanLine(py));
+        for (int px = 0; px < imageSize.width(); ++px) {
+            const int id = decodeId(line[px]);
+            if (id == 0) {
+                ++untouched;
+                continue;
             }
-            else if (mode == SampleMode::LastCell)
-            {
-                colorIndex = sampleColor(px, py, 0.999, 0.999);
+            if (id < 1 || id > nx * ny) {
+                qWarning() << "Unexpected ID:" << id;
+                continue;
             }
-            else
-            {
-                int counts[11] = {0};
-
-                for (int syi = 0; syi < 4; ++syi)
-                {
-                    for (int sxi = 0; sxi < 4; ++sxi)
-                    {
-                        const int ci = sampleColor(
-                            px, py,
-                            (sxi + 0.5) / 4.0,
-                            (syi + 0.5) / 4.0);
-                        if (ci >= 0)
-                            ++counts[ci];
-                    }
-                }
-
-                int bestCount = 0;
-                for (int i = 0; i < 11; ++i)
-                {
-                    if (counts[i] > bestCount)
-                    {
-                        bestCount = counts[i];
-                        colorIndex = i;
-                    }
+            const int painterIx = (id - 1) % nx;
+            const int painterIy = (id - 1) / nx;
+            const QPointF p = inverse.map(QPointF(px + 0.5, py + 0.5));
+            const int centerIx = centerIndex((p.x() - firstX), stepX, nx);
+            const int centerIy = centerIndex((p.y() - firstY), stepY, ny);
+            const int dx = painterIx - centerIx;
+            const int dy = painterIy - centerIy;
+            minDx = std::min(minDx, dx);
+            maxDx = std::max(maxDx, dx);
+            minDy = std::min(minDy, dy);
+            maxDy = std::max(maxDy, dy);
+            if (dx == 0 && dy == 0) {
+                ++matched;
+            } else {
+                ++mismatched;
+                if (shown++ < 20) {
+                    qDebug() << "Pixel" << px << py
+                             << "Painter(ix,iy)" << painterIx << painterIy
+                             << "Center(ix,iy)" << centerIx << centerIy
+                             << "Delta(dx,dy)" << dx << dy;
                 }
             }
-
-            if (colorIndex >= 0)
-                line[px] = colors[colorIndex];
         }
     }
 
-    qDebug() << "PDMAP Scanline mode:" << static_cast<int>(mode)
-             << "Matrix:" << nx << "x" << ny
-             << "Image:" << image.size()
-             << "Elapsed(ms):" << timer.nsecsElapsed() / 1000000.0;
-    return true;
+    qDebug() << "Pixels:" << imageSize.width() * imageSize.height();
+    qDebug() << "Untouched:" << untouched;
+    qDebug() << "Matched:" << matched << "Mismatched:" << mismatched;
+    if (matched + mismatched > 0)
+        qDebug() << "Delta range X:" << minDx << maxDx
+                 << "Y:" << minDy << maxDy;
+    baseline.save("candy_id_debug.png");
+    qDebug() << "Saved candy_id_debug.png (RGB encodes cell ID; not a natural-color image)";
+    return 0;
 }
-
-/*
-Integration example (inside your existing rendering function):
-
-    // Construct from the SAME geometry used by your drawRects path:
-    // QRectF windowRect(xMin, yMin, windowX, windowY);
-    // QRectF stepRect(xMin, yMin, stepX, stepY);
-    // stepRect.moveCenter(windowRect.center());
-    // double startX = stepRect.left();
-    // double startY = stepRect.top();
-
-    // const QTransform painterTransform = ...; // existing painter transform
-    // QRgb colors[11] = { ... };                 // existing color table
-    // auto colorFn = [&](double density) {
-    //     return getDensityColorIndex(density); // existing function
-    // };
-    //
-    // renderPdmapSampling(image, values, nx, ny,
-    //     stepX, stepY, startX, startY, painterTransform,
-    //     colors, colorFn, SampleMode::Center);
-    //
-    // For the second/third run use SampleMode::LastCell or
-    // SampleMode::Majority4x4.
-    //
-    // NOTE: No main() here. This is an integration snippet, not a
-    // standalone program. Do not compile candy.cpp by itself.
-*/
