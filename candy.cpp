@@ -6,6 +6,7 @@
 // Usage: ./candy [nx ny imageWidth imageHeight]
 // Example: ./candy 66667 22500 992 336
 //
+// Reads raw density through callback, maps to palette index, then averages indices.
 // Important: matches the earlier experiment's AVERAGE PALETTE INDEX, not
 // average raw density. It does not reproduce QPainter flush semantics exactly.
 
@@ -39,16 +40,18 @@ static int clampIndex(long long i, int n) {
 }
 
 // Main integration point:
-// indexAt(x,y) -> palette index (0..paletteCount-1), or -1 to skip.
-// colorAt(index) -> packed QRgb. Both callbacks must be thread-safe only if
+// densityAt(x,y) -> actual density value.
+// densityToIndex(density) -> palette index (0..paletteCount-1), or -1 to skip.
+// colorAt(index) -> packed QRgb. Callbacks must be thread-safe only if
 // caller later introduces threading; this implementation is single-threaded.
 //
 // Returns false for invalid dimensions/geometry, or QImage allocation failure.
 // Matrix storage and lifetime remain fully controlled by the caller.
-template <typename IndexAt, typename ColorAt>
+template <typename DensityAt, typename DensityToIndex, typename ColorAt>
 bool renderAverageScanLine(const AverageScanlineInput &in,
                            int paletteCount,
-                           IndexAt indexAt,
+                           DensityAt densityAt,
+                           DensityToIndex densityToIndex,
                            ColorAt colorAt,
                            QImage &out)
 {
@@ -111,7 +114,9 @@ bool renderAverageScanLine(const AverageScanlineInput &in,
                         std::min(mX1, double(x + 1)) - std::max(mX0, double(x)));
                     const double area = wx * wy;
                     if (area <= 0.0) continue;
-                    const int idx = indexAt(x, y);
+                    const double density = densityAt(x, y);
+                    if (!std::isfinite(density)) continue;
+                    const int idx = densityToIndex(density);
                     if (idx < 0 || idx >= paletteCount) continue;
                     weightedIndex += idx * area;
                     totalArea += area;
@@ -138,10 +143,15 @@ static QRgb demoPalette(int i) {
     };
     return p[i];
 }
-static int demoIndex(int x, int y) {
+static double demoDensity(int x, int y) {
     const int band = (x / 17 + y / 11) % PALETTE_COUNT;
     const int detail = ((13LL*x + 7LL*y) % 19 == 0) ? 3 : 0;
-    return (band + detail) % PALETTE_COUNT;
+    return double((band + detail) % PALETTE_COUNT) / double(PALETTE_COUNT - 1);
+}
+static int demoDensityToIndex(double density) {
+    if (density < 0.0 || density > 1.0) return -1;
+    return std::max(0, std::min(PALETTE_COUNT - 1,
+        int(std::floor(density * (PALETTE_COUNT - 1) + 0.5))));
 }
 static int argPositive(char *s, int fallback) {
     if (!s) return fallback;
@@ -167,7 +177,7 @@ int main(int argc, char **argv) {
     QImage output;
     QElapsedTimer timer;
     timer.start();
-    if (!renderAverageScanLine(in, PALETTE_COUNT, demoIndex, demoPalette, output)) {
+    if (!renderAverageScanLine(in, PALETTE_COUNT, demoDensity, demoDensityToIndex, demoPalette, output)) {
         qCritical() << "Invalid geometry or QImage allocation failed";
         return 1;
     }
