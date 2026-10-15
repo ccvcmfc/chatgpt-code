@@ -4,9 +4,7 @@
 // Physical coordinate: X increases right, Y increases UP.
 // QImage coordinate: X increases right, Y increases DOWN.
 // Current viewport is expressed by its physical min/max region.
-// Compile: g++ -O3 -std=c++11 -fPIC candy.cpp -o candy $(pkg-config --cflags --libs Qt5Core Qt5Gui)
-// Run: ./candy
-// NOTE: Replace synthetic density/color callbacks in your project.
+// Integration-only source: no main(), no synthetic input, no demo palette.
 // This averages palette indices (matching prior experiment), not raw densities.
 
 #include <QCoreApplication>
@@ -131,45 +129,3 @@ bool renderAverageScanLine(const AverageScanlineInput &in,
     return true;
 }
 
-// Standalone demo only. Remove main() when integrating.
-static const int DEMO_COLORS = 11;
-static double demoDensity(int x, int y) {
-    const int band = (x / 17 + y / 11) % DEMO_COLORS;
-    const int detail = ((13LL*x + 7LL*y) % 19 == 0) ? 3 : 0;
-    return double((band + detail) % DEMO_COLORS) / (DEMO_COLORS - 1);
-}
-static int demoDensityToIndex(double d) {
-    if (!std::isfinite(d) || d < 0.0 || d > 1.0) return -1;
-    return std::max(0, std::min(DEMO_COLORS - 1,
-        int(std::floor(d * (DEMO_COLORS - 1) + 0.5))));
-}
-static QRgb demoColor(int i) {
-    static const QRgb colors[DEMO_COLORS] = {
-        qRgb(20,25,55), qRgb(42,100,190), qRgb(32,175,125),
-        qRgb(245,195,60), qRgb(220,85,70), qRgb(150,80,195),
-        qRgb(235,235,235), qRgb(75,170,210), qRgb(180,135,60),
-        qRgb(85,90,100), qRgb(240,115,175)
-    };
-    return colors[i];
-}
-int main(int argc, char **argv) {
-    QCoreApplication app(argc, argv);
-    AverageScanlineInput in;
-    in.nx = 600; in.ny = 240;
-    in.originX = 0; in.originY = 0;
-    in.stepX = 0.06; in.stepY = 0.06;
-    in.region = DensityRegion{0, 0, in.nx * in.stepX, in.ny * in.stepY};
-    in.imageWidth = 60; in.imageHeight = 24;
-    QImage image;
-    if (!renderAverageScanLine(in, DEMO_COLORS, demoDensity,
-                               demoDensityToIndex, demoColor, image)) {
-        qCritical() << "AverageScanLine failed";
-        return 1;
-    }
-    if (!image.save("candy_average_full.png")) {
-        qCritical() << "Image save failed";
-        return 1;
-    }
-    qDebug() << "Saved candy_average_full.png";
-    return 0;
-}
