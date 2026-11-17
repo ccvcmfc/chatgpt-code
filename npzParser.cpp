@@ -1,7 +1,7 @@
 // npzParser.cpp
 // Standalone C++11 NPZ reader, Qt 5.9 compatible.
 // Only dependency: zlib (qmake: LIBS += -lz).
-// Reads mask.npy: uint8, C-order, shape (C,H,W).
+// Auto-detects one uint8 C-order (C,H,W) array; lists all NPZ members.
 // Optionally reads layer_ids.npy: little-endian signed int32/int64.
 // Supports ZIP stored/deflate, ZIP64 central directory, CRC32 verification.
 // Does not support encrypted or multi-disk ZIP archives.
@@ -78,6 +78,11 @@ public:
                     static_cast<std::streamsize>(bytes_.size())))
             throw std::runtime_error("Cannot read NPZ file");
         parseDirectory();
+    }
+    std::vector<std::string> names() const {
+        std::vector<std::string> result;
+        for (const ZipEntry& e : entries_) result.push_back(e.name);
+        return result;
     }
     bool has(const std::string& name) const {
         for (const ZipEntry& e : entries_)
@@ -365,24 +370,46 @@ std::vector<int64_t> decodeLayers(const Npy& a, size_t channels) {
 }
 } // namespace
 
+// List all ZIP members without assuming any NumPy array name.
+std::vector<std::string> listNpzEntries(const std::string& path) {
+    return ZipArchive(path).names();
+}
+
 NpzMask loadNpzMask(const std::string& path) {
     const ZipArchive zip(path);
-    const Npy a = parseNpy(zip.read("mask.npy"));
-    if (a.dtype != "|u1" && a.dtype != "<u1" && a.dtype != "=u1")
-        throw std::runtime_error("mask.npy must be uint8");
-    if (a.fortran || a.shape.size() != 3)
-        throw std::runtime_error("mask.npy must be C-order (C,H,W)");
+    const std::vector<std::string> names = zip.names();
+    std::string selected;
+    Npy selectedArray;
+    size_t matches = 0;
+    for (const std::string& name : names) {
+        if (name.size() < 4 || name.substr(name.size() - 4) != ".npy")
+            continue;
+        // Skip conventional metadata arrays.
+        if (name == "layer_ids.npy")
+            continue;
+        const Npy a = parseNpy(zip.read(name));
+        if ((a.dtype != "|u1" && a.dtype != "<u1" && a.dtype != "=u1") ||
+            a.fortran || a.shape.size() != 3)
+            continue;
+        if (!a.shape[0] || !a.shape[1] || !a.shape[2])
+            continue;
+        const size_t expected =
+            checkedMul(checkedMul(a.shape[0], a.shape[1]), a.shape[2]);
+        if (a.bytes.size() != expected)
+            throw std::runtime_error("Invalid mask data size: " + name);
+        selected = name;
+        selectedArray = a;
+        ++matches;
+    }
+    if (matches == 0)
+        throw std::runtime_error("No uint8 C-order (C,H,W) NPY array found");
+    if (matches > 1)
+        throw std::runtime_error("Multiple mask candidates; select an array explicitly");
     NpzMask mask;
-    mask.channels = a.shape[0];
-    mask.height = a.shape[1];
-    mask.width = a.shape[2];
-    if (!mask.channels || !mask.height || !mask.width)
-        throw std::runtime_error("Zero-sized mask dimension");
-    const size_t expected =
-        checkedMul(checkedMul(mask.channels, mask.height), mask.width);
-    if (a.bytes.size() != expected)
-        throw std::runtime_error("mask.npy byte size mismatch");
-    mask.pixels = a.bytes;
+    mask.channels = selectedArray.shape[0];
+    mask.height = selectedArray.shape[1];
+    mask.width = selectedArray.shape[2];
+    mask.pixels.swap(selectedArray.bytes);
     if (zip.has("layer_ids.npy"))
         mask.layerIds = decodeLayers(
             parseNpy(zip.read("layer_ids.npy")), mask.channels);
@@ -392,6 +419,7 @@ NpzMask loadNpzMask(const std::string& path) {
 #ifdef NPZ_ENABLE_QT_DEBUG
 #include <QDebug>
 #include <QString>
+#include <QStringList>
 
 // Set a breakpoint here or inside loadNpzMask()/parseNpy().
 // Enable with DEFINES += NPZ_ENABLE_QT_DEBUG in your .pro file.
@@ -399,7 +427,25 @@ void debugNpzFile(const QString& filePath)
 {
     try {
         qDebug() << "NPZ file:" << filePath;
-        const NpzMask mask = loadNpzMask(filePath.toLocal8Bit().constData());
+        const std::string path = filePath.toLocal8Bit().constData();
+        const ZipArchive archive(path);
+        for (const std::string& name : archive.names()) {
+            qDebug() << "NPZ entry:" << QString::fromStdString(name);
+            if (name.size() >= 4 && name.substr(name.size()-4) == ".npy") {
+                try {
+                    const Npy a = parseNpy(archive.read(name));
+                    QStringList dims;
+                    for (size_t dim : a.shape)
+                        dims << QString::number(static_cast<qulonglong>(dim));
+                    qDebug() << "  dtype:" << QString::fromStdString(a.dtype)
+                             << "shape:" << dims.join("x")
+                             << "Fortran:" << a.fortran;
+                } catch (const std::exception& e) {
+                    qWarning() << "  NPY inspect error:" << e.what();
+                }
+            }
+        }
+        const NpzMask mask = loadNpzMask(path);
         qDebug() << "Shape (C,H,W):"
                  << static_cast<qulonglong>(mask.channels)
                  << static_cast<qulonglong>(mask.height)
