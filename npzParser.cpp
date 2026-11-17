@@ -388,3 +388,44 @@ NpzMask loadNpzMask(const std::string& path) {
             parseNpy(zip.read("layer_ids.npy")), mask.channels);
     return mask;
 }
+
+#ifdef NPZ_ENABLE_QT_DEBUG
+#include <QDebug>
+#include <QString>
+
+// Set a breakpoint here or inside loadNpzMask()/parseNpy().
+// Enable with DEFINES += NPZ_ENABLE_QT_DEBUG in your .pro file.
+void debugNpzFile(const QString& filePath)
+{
+    try {
+        qDebug() << "NPZ file:" << filePath;
+        const NpzMask mask = loadNpzMask(filePath.toLocal8Bit().constData());
+        qDebug() << "Shape (C,H,W):"
+                 << static_cast<qulonglong>(mask.channels)
+                 << static_cast<qulonglong>(mask.height)
+                 << static_cast<qulonglong>(mask.width);
+        qDebug() << "Data bytes:"
+                 << static_cast<qulonglong>(mask.pixels.size());
+        for (size_t c = 0; c < mask.channels; ++c) {
+            size_t zeros = 0, filled = 0, unexpected = 0;
+            const size_t begin = c * mask.height * mask.width;
+            const size_t end = begin + mask.height * mask.width;
+            for (size_t i = begin; i < end; ++i) {
+                const uint8_t value = mask.pixels[i];
+                if (value == 0) ++zeros;
+                else if (value == 255) ++filled;
+                else ++unexpected;
+            }
+            const qlonglong layer = c < mask.layerIds.size()
+                ? static_cast<qlonglong>(mask.layerIds[c]) : -1;
+            qDebug() << "Channel:" << static_cast<qulonglong>(c)
+                     << "Layer:" << layer
+                     << "Zero:" << static_cast<qulonglong>(zeros)
+                     << "Filled:" << static_cast<qulonglong>(filled)
+                     << "Other:" << static_cast<qulonglong>(unexpected);
+        }
+    } catch (const std::exception& e) {
+        qWarning() << "NPZ parse failed:" << e.what();
+    }
+}
+#endif
