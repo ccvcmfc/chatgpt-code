@@ -453,11 +453,13 @@ void debugNpzFile(const QString& filePath)
         qDebug() << "Data bytes:"
                  << static_cast<qulonglong>(mask.pixels.size());
         for (size_t c = 0; c < mask.channels; ++c) {
+            uint64_t pixelSum = 0;
             size_t zeros = 0, filled = 0, unexpected = 0;
             const size_t begin = c * mask.height * mask.width;
             const size_t end = begin + mask.height * mask.width;
             for (size_t i = begin; i < end; ++i) {
                 const uint8_t value = mask.pixels[i];
+                pixelSum += value;
                 if (value == 0) ++zeros;
                 else if (value == 255) ++filled;
                 else ++unexpected;
@@ -466,6 +468,7 @@ void debugNpzFile(const QString& filePath)
                 ? static_cast<qlonglong>(mask.layerIds[c]) : -1;
             qDebug() << "Channel:" << static_cast<qulonglong>(c)
                      << "Layer:" << layer
+                     << "Pixel sum:" << static_cast<qulonglong>(pixelSum)
                      << "Zero:" << static_cast<qulonglong>(zeros)
                      << "Filled:" << static_cast<qulonglong>(filled)
                      << "Other:" << static_cast<qulonglong>(unexpected);
