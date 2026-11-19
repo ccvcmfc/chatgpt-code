@@ -134,6 +134,14 @@ int renderClip(const ClipPolygons& layers,
 }
 
 // Patch little-endian numeric fields in a fixed binary header.
+static void setLe16(QByteArray& bytes, int offset, quint16 value) {
+    qToLittleEndian<quint16>(value,
+        reinterpret_cast<uchar*>(bytes.data() + offset));
+}
+static void setLe64(QByteArray& bytes, int offset, quint64 value) {
+    qToLittleEndian<quint64>(value,
+        reinterpret_cast<uchar*>(bytes.data() + offset));
+}
 static void setLe32(QByteArray& bytes, int offset, quint32 value) {
     qToLittleEndian<quint32>(value,
         reinterpret_cast<uchar*>(bytes.data() + offset));
@@ -154,8 +162,8 @@ static int makeNpy(const Raster& r, std::vector<uint8_t>& npy) {
         return -6; // NPY header format limit
     npy.clear();
     const size_t prefixSize = 10 + header.size();
-    if (prefixSize > UINT32_MAX || r.pixels.size() > UINT32_MAX - prefixSize)
-        return -2; // size overflow or ZIP32 size limit
+    if (prefixSize > std::numeric_limits<size_t>::max() - r.pixels.size())
+        return -2; // NPY buffer size overflow
     npy.reserve(prefixSize + r.pixels.size());
     const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
     npy.insert(npy.end(), magic, magic + sizeof(magic));
@@ -199,69 +207,110 @@ static int deflateRaw(const std::vector<uint8_t>& src, std::vector<uint8_t>& out
     return 0;
 }
 
-int saveNpz(const std::string& filename, const Raster& raster) {
+// ZIP64 is allowed only when requested and required by the actual sizes.
+// A small archive keeps the ZIP32 layout for compatibility with older readers.
+int saveNpz(const std::string& filename, const Raster& raster,
+            bool allowZip64 = true) {
     std::vector<uint8_t> npy, compressed;
     int rc = makeNpy(raster, npy);
-    if (rc < 0) return rc; // propagate error code from called function
+    if (rc < 0) return rc; // NPY construction failed
     rc = deflateRaw(npy, compressed);
-    if (rc < 0) return rc;
-    if (npy.size() > UINT32_MAX || compressed.size() > UINT32_MAX) return -2; // size overflow or ZIP32 size limit
-    const uint32_t originalSize = static_cast<uint32_t>(npy.size());
-    const uint32_t compressedSize = static_cast<uint32_t>(compressed.size());
-    const std::string entry = "data.npy";
-    uint32_t crc = crc32(0L, Z_NULL, 0);
+    if (rc < 0) return rc; // DEFLATE compression failed
+
+    const quint64 originalSize = static_cast<quint64>(npy.size());
+    const quint64 compressedSize = static_cast<quint64>(compressed.size());
+    const QByteArray entry("data.npy");
+    const quint64 filenameLength = static_cast<quint64>(entry.size());
+    const quint64 localBase = 30 + filenameLength;
+    const quint64 centralBase = 46 + filenameLength;
+    const quint64 zip32Maximum = UINT32_MAX;
+
+    // The ZIP32 layout is selected only when all relevant sizes and
+    // offsets fit. Include the archive end in the size check.
+    const bool useZip64 =
+        originalSize >= zip32Maximum ||
+        compressedSize >= zip32Maximum ||
+        compressedSize > zip32Maximum - localBase - centralBase - 22;
+    if (useZip64 && !allowZip64)
+        return -2; // ZIP64 required but disabled
+
+    const quint64 localExtraSize = useZip64 ? 20 : 0;
+    const quint64 centralExtraSize = useZip64 ? 20 : 0;
+    const quint64 centralOffset = localBase + localExtraSize + compressedSize;
+    const quint64 centralSize = centralBase + centralExtraSize;
+    if (centralOffset > std::numeric_limits<quint64>::max() - centralSize - 98)
+        return -2; // ZIP archive size overflow
+
+    quint32 crc = crc32(0L, Z_NULL, 0);
     for (size_t i = 0; i < npy.size(); i += 65536) {
         const size_t n = std::min<size_t>(65536, npy.size() - i);
         crc = crc32(crc, npy.data() + i, static_cast<uInt>(n));
     }
 
-    // ZIP32 single-entry archive. Constant header fields are defined once;
-    // only CRC, sizes, and offsets are patched below.
-    static const char localTemplate[30] = {
-        0x50, 0x4b, 0x03, 0x04,  20, 0,  0, 0,  8, 0,
-        0, 0,  0, 0,           0, 0, 0, 0,  0, 0, 0, 0,
-        0, 0, 0, 0,            8, 0,  0, 0
-    };
-    static const char centralTemplate[46] = {
-        0x50, 0x4b, 0x01, 0x02,  20, 0,  20, 0,  0, 0,
-        8, 0,  0, 0,  0, 0,     0, 0, 0, 0,  0, 0, 0, 0,
-        0, 0, 0, 0,             8, 0,  0, 0,  0, 0,
-        0, 0,  0, 0,            0, 0, 0, 0,  0, 0, 0, 0
-    };
-    static const char endTemplate[22] = {
-        0x50, 0x4b, 0x05, 0x06,  0, 0,  0, 0,
-        1, 0,  1, 0,           0, 0, 0, 0,
-        0, 0, 0, 0,            0, 0
-    };
-
-    QByteArray local(localTemplate, sizeof(localTemplate));
-    QByteArray central(centralTemplate, sizeof(centralTemplate));
-    QByteArray ending(endTemplate, sizeof(endTemplate));
-
+    QByteArray local(30, '\0');
+    QByteArray central(46, '\0');
+    QByteArray ending(22, '\0');
+    setLe32(local, 0, 0x04034b50);
+    setLe16(local, 4, useZip64 ? 45 : 20);
+    setLe16(local, 8, 8); // DEFLATE
     setLe32(local, 14, crc);
-    setLe32(local, 18, compressedSize);
-    setLe32(local, 22, originalSize);
+    setLe32(local, 18, useZip64 ? UINT32_MAX : static_cast<quint32>(compressedSize));
+    setLe32(local, 22, useZip64 ? UINT32_MAX : static_cast<quint32>(originalSize));
+    setLe16(local, 26, static_cast<quint16>(filenameLength));
+    setLe16(local, 28, static_cast<quint16>(localExtraSize));
 
+    setLe32(central, 0, 0x02014b50);
+    setLe16(central, 4, useZip64 ? 45 : 20);
+    setLe16(central, 6, useZip64 ? 45 : 20);
+    setLe16(central, 10, 8); // DEFLATE
     setLe32(central, 16, crc);
-    setLe32(central, 20, compressedSize);
-    setLe32(central, 24, originalSize);
+    setLe32(central, 20, useZip64 ? UINT32_MAX : static_cast<quint32>(compressedSize));
+    setLe32(central, 24, useZip64 ? UINT32_MAX : static_cast<quint32>(originalSize));
+    setLe16(central, 28, static_cast<quint16>(filenameLength));
+    setLe16(central, 30, static_cast<quint16>(centralExtraSize));
 
-    const size_t centralOffsetSize =
-        local.size() + entry.size() + compressed.size();
-    if (centralOffsetSize > UINT32_MAX || central.size() + entry.size() > UINT32_MAX) return -2; // size overflow or ZIP32 size limit
-    const uint32_t centralOffset = static_cast<uint32_t>(centralOffsetSize);
-    const uint32_t centralSize = static_cast<uint32_t>(central.size() + entry.size());
-    if (centralOffsetSize + centralSize + ending.size() > UINT32_MAX)
-        return -2; // size overflow or ZIP32 size limit
+    setLe32(ending, 0, 0x06054b50);
+    setLe16(ending, 8, 1);
+    setLe16(ending, 10, 1);
+    setLe32(ending, 12, useZip64 ? UINT32_MAX : static_cast<quint32>(centralSize));
+    setLe32(ending, 16, useZip64 ? UINT32_MAX : static_cast<quint32>(centralOffset));
 
-    setLe32(ending, 12, centralSize);
-    setLe32(ending, 16, centralOffset);
+    QByteArray localExtra;
+    QByteArray centralExtra;
+    QByteArray zip64Ending;
+    QByteArray zip64Locator;
+    if (useZip64) {
+        localExtra = QByteArray(20, '\0');
+        setLe16(localExtra, 0, 0x0001); // ZIP64 extra field
+        setLe16(localExtra, 2, 16);
+        setLe64(localExtra, 4, originalSize);
+        setLe64(localExtra, 12, compressedSize);
 
-    // Write directly to a temporary file and atomically commit on success.
-    // Avoid a second full-size ZIP buffer in memory.
+        centralExtra = QByteArray(20, '\0');
+        setLe16(centralExtra, 0, 0x0001);
+        setLe16(centralExtra, 2, 16);
+        setLe64(centralExtra, 4, originalSize);
+        setLe64(centralExtra, 12, compressedSize);
+
+        zip64Ending = QByteArray(56, '\0');
+        setLe32(zip64Ending, 0, 0x06064b50);
+        setLe64(zip64Ending, 4, 44); // Size excluding signature and size field
+        setLe16(zip64Ending, 12, 45);
+        setLe16(zip64Ending, 14, 45);
+        setLe64(zip64Ending, 24, 1);
+        setLe64(zip64Ending, 32, 1);
+        setLe64(zip64Ending, 40, centralSize);
+        setLe64(zip64Ending, 48, centralOffset);
+
+        zip64Locator = QByteArray(20, '\0');
+        setLe32(zip64Locator, 0, 0x07064b50);
+        setLe64(zip64Locator, 8, centralOffset + centralSize);
+        setLe32(zip64Locator, 16, 1);
+    }
+
     QSaveFile file(QString::fromStdString(filename));
     if (!file.open(QIODevice::WriteOnly))
-        return -5; // file open/write/commit failure
+        return -5; // File open failed
 
     const auto writeBytes = [&file](const char* data, size_t count) -> bool {
         return count <= static_cast<size_t>(std::numeric_limits<qint64>::max()) &&
@@ -269,15 +318,20 @@ int saveNpz(const std::string& filename, const Raster& raster) {
     };
 
     if (!writeBytes(local.constData(), static_cast<size_t>(local.size())) ||
-        !writeBytes(entry.data(), entry.size()) ||
+        !writeBytes(entry.constData(), static_cast<size_t>(entry.size())) ||
+        !writeBytes(localExtra.constData(), static_cast<size_t>(localExtra.size())) ||
         !writeBytes(reinterpret_cast<const char*>(compressed.data()), compressed.size()) ||
         !writeBytes(central.constData(), static_cast<size_t>(central.size())) ||
-        !writeBytes(entry.data(), entry.size()) ||
+        !writeBytes(entry.constData(), static_cast<size_t>(entry.size())) ||
+        !writeBytes(centralExtra.constData(), static_cast<size_t>(centralExtra.size())) ||
+        !writeBytes(zip64Ending.constData(), static_cast<size_t>(zip64Ending.size())) ||
+        !writeBytes(zip64Locator.constData(), static_cast<size_t>(zip64Locator.size())) ||
         !writeBytes(ending.constData(), static_cast<size_t>(ending.size()))) {
         file.cancelWriting();
-        return -5; // file open/write/commit failure
+        return -5; // File write failed
     }
-    if (!file.commit()) return -5; // file commit failed
+    if (!file.commit())
+        return -5; // File commit failed
     return 0;
 }
 
@@ -291,14 +345,15 @@ int clipFilename(int clipId, std::string& filename) {
 
 int writeClip(int clipId, const ClipPolygons& layers,
               double centerXUm, double centerYUm,
-              double clipUm, double pixelUm, double dbuUm) {
+              double clipUm, double pixelUm, double dbuUm,
+              bool allowZip64 = true) {
     std::string filename;
     int rc = clipFilename(clipId, filename);
     if (rc < 0) return rc;
     Raster raster;
     rc = renderClip(layers, centerXUm, centerYUm, clipUm, pixelUm, dbuUm, raster);
     if (rc < 0) return rc;
-    return saveNpz(filename, raster); // propagate save status (0 or negative)
+    return saveNpz(filename, raster, allowZip64); // propagate save status (0 or negative)
 }
 
 } // namespace clipnpz
