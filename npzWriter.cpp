@@ -31,26 +31,24 @@ typedef std::vector<LayerPolygons> ClipPolygons;
 static const int SHIFT_BITS = 5;
 static const int SHIFT_MULT = 1 << SHIFT_BITS;
 
-static void require(bool ok, const char* message) {
-    if (!ok) throw std::runtime_error(message);
-}
 static size_t checkedMul(size_t a, size_t b) {
-    require(b == 0 || a <= std::numeric_limits<size_t>::max() / b,
-            "Size overflow");
+    if (!(b == 0 || a <= std::numeric_limits<size_t>::max() / b))
+        throw std::runtime_error("Size overflow");
     return a * b;
 }
 static int checkedCvCoord(double x) {
-    require(std::isfinite(x) &&
+    if (!(std::isfinite(x) &&
             x >= static_cast<double>(std::numeric_limits<int32_t>::min()) &&
-            x <= static_cast<double>(std::numeric_limits<int32_t>::max()),
-            "OpenCV fixed-point coordinate out of int32 range");
+            x <= static_cast<double>(std::numeric_limits<int32_t>::max())))
+        throw std::runtime_error("OpenCV fixed-point coordinate out of int32 range");
     // np.round uses round-to-nearest-even; nearbyint matches under FE_TONEAREST.
     return static_cast<int>(std::nearbyint(x));
 }
 static int64_t checkedTrunc(double x) {
-    require(std::isfinite(x) &&
+    if (!(std::isfinite(x) &&
             x >= static_cast<double>(std::numeric_limits<int64_t>::min()) &&
-            x < 9223372036854775808.0, "DBU coordinate out of range");
+            x < 9223372036854775808.0))
+        throw std::runtime_error("DBU coordinate out of range");
     return static_cast<int64_t>(x); // Python int() truncates toward zero
 }
 
@@ -62,13 +60,14 @@ struct Raster {
 Raster renderClip(const ClipPolygons& layers,
                   double centerXUm, double centerYUm,
                   double clipUm, double pixelUm, double dbuUm) {
-    require(std::isfinite(clipUm) && std::isfinite(pixelUm) &&
+    if (!(std::isfinite(clipUm) && std::isfinite(pixelUm) &&
             std::isfinite(dbuUm) && std::isfinite(centerXUm) &&
             std::isfinite(centerYUm) &&
-            clipUm > 0 && pixelUm > 0 && dbuUm > 0, "Invalid geometry");
+            clipUm > 0 && pixelUm > 0 && dbuUm > 0))
+        throw std::runtime_error("Invalid geometry");
     const double hFloat = clipUm / pixelUm;
-    require(hFloat >= 1 && hFloat <= static_cast<double>(INT32_MAX),
-            "Invalid clip dimensions");
+    if (!(hFloat >= 1 && hFloat <= static_cast<double>(INT32_MAX)))
+        throw std::runtime_error("Invalid clip dimensions");
     const int h = static_cast<int>(hFloat); // matches Python int(...)
     const int64_t x0d = checkedTrunc((centerXUm - clipUm / 2.0) / dbuUm);
     const int64_t y0d = checkedTrunc((centerYUm - clipUm / 2.0) / dbuUm);
@@ -130,12 +129,14 @@ static void setLe32(QByteArray& bytes, int offset, quint32 value) {
         reinterpret_cast<uchar*>(bytes.data() + offset));
 }
 static uint32_t as32(size_t n) {
-    require(n <= UINT32_MAX, "ZIP32 limit exceeded; ZIP64 not implemented");
+    if (!(n <= UINT32_MAX))
+        throw std::runtime_error("ZIP32 limit exceeded; ZIP64 not implemented");
     return static_cast<uint32_t>(n);
 }
 static std::vector<uint8_t> makeNpy(const Raster& r) {
-    require(r.pixels.size() == checkedMul(r.channels,
-            checkedMul(r.height, r.width)), "Raster buffer size mismatch");
+    if (!(r.pixels.size() == checkedMul(r.channels,
+            checkedMul(r.height, r.width))))
+        throw std::runtime_error("Raster buffer size mismatch");
     std::string header = "{'descr': '|u1', 'fortran_order': False, 'shape': (" +
         std::to_string(r.channels) + ", " + std::to_string(r.height) +
         ", " + std::to_string(r.width) + "), }";
@@ -143,7 +144,8 @@ static std::vector<uint8_t> makeNpy(const Raster& r) {
     const size_t padding = (16 - ((10 + header.size() + 1) % 16)) % 16;
     header.append(padding, ' ');
     header.push_back('\n');
-    require(header.size() <= UINT16_MAX, "NPY v1 header too large");
+    if (!(header.size() <= UINT16_MAX))
+        throw std::runtime_error("NPY v1 header too large");
     std::vector<uint8_t> npy;
     npy.reserve(10 + header.size() + r.pixels.size());
     const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
@@ -158,9 +160,9 @@ static std::vector<uint8_t> makeNpy(const Raster& r) {
 static std::vector<uint8_t> deflateRaw(const std::vector<uint8_t>& src) {
     z_stream zs;
     std::memset(&zs, 0, sizeof(zs));
-    require(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-                         -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK,
-            "deflateInit2 failed");
+    if (!(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                         -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK))
+        throw std::runtime_error("deflateInit2 failed");
     std::vector<uint8_t> out;
     uint8_t buffer[65536];
     size_t inputOffset = 0;
@@ -235,8 +237,8 @@ void saveNpz(const std::string& filename, const Raster& raster) {
         local.size() + entry.size() + compressed.size();
     const uint32_t centralOffset = as32(centralOffsetSize);
     const uint32_t centralSize = as32(central.size() + entry.size());
-    require(centralOffsetSize + centralSize + ending.size() <= UINT32_MAX,
-            "ZIP32 archive too large");
+    if (!(centralOffsetSize + centralSize + ending.size() <= UINT32_MAX))
+        throw std::runtime_error("ZIP32 archive too large");
 
     setLe32(ending, 12, centralSize);
     setLe32(ending, 16, centralOffset);
@@ -256,14 +258,17 @@ void saveNpz(const std::string& filename, const Raster& raster) {
     addBytes(ending.constData(), static_cast<size_t>(ending.size()));
 
     std::ofstream file(filename.c_str(), std::ios::binary | std::ios::trunc);
-    require(file.is_open(), "Cannot open NPZ output file");
+    if (!(file.is_open()))
+        throw std::runtime_error("Cannot open NPZ output file");
     file.write(reinterpret_cast<const char*>(zip.data()),
                static_cast<std::streamsize>(zip.size()));
-    require(file.good(), "Failed writing NPZ");
+    if (!(file.good()))
+        throw std::runtime_error("Failed writing NPZ");
 }
 
 std::string clipFilename(int clipId) {
-    require(clipId >= 0, "clipId must be nonnegative");
+    if (!(clipId >= 0))
+        throw std::runtime_error("clipId must be nonnegative");
     char name[64];
     std::snprintf(name, sizeof(name), "clip_%05d.npz", clipId);
     return std::string(name);
