@@ -8,6 +8,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <zlib.h>
+#include <QByteArray>
+#include <QtEndian>
 
 #include <algorithm>
 #include <cmath>
@@ -118,11 +120,14 @@ Raster renderClip(const ClipPolygons& layers,
     return result;
 }
 
-static void append16(std::vector<uint8_t>& b, uint16_t v) {
-    b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8));
+// Patch little-endian numeric fields in a fixed binary header.
+static void setLe16(QByteArray& bytes, int offset, quint16 value) {
+    qToLittleEndian<quint16>(value,
+        reinterpret_cast<uchar*>(bytes.data() + offset));
 }
-static void append32(std::vector<uint8_t>& b, uint32_t v) {
-    for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i)));
+static void setLe32(QByteArray& bytes, int offset, quint32 value) {
+    qToLittleEndian<quint32>(value,
+        reinterpret_cast<uchar*>(bytes.data() + offset));
 }
 static uint32_t as32(size_t n) {
     require(n <= UINT32_MAX, "ZIP32 limit exceeded; ZIP64 not implemented");
@@ -143,7 +148,8 @@ static std::vector<uint8_t> makeNpy(const Raster& r) {
     npy.reserve(10 + header.size() + r.pixels.size());
     const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
     npy.insert(npy.end(), magic, magic + sizeof(magic));
-    append16(npy, static_cast<uint16_t>(header.size()));
+    npy.push_back(static_cast<uint8_t>(header.size() & 0xff));
+    npy.push_back(static_cast<uint8_t>((header.size() >> 8) & 0xff));
     npy.insert(npy.end(), header.begin(), header.end());
     npy.insert(npy.end(), r.pixels.begin(), r.pixels.end());
     return npy;
@@ -194,36 +200,60 @@ void saveNpz(const std::string& filename, const Raster& raster) {
         crc = crc32(crc, npy.data() + i, static_cast<uInt>(n));
     }
 
-    std::vector<uint8_t> zip;
-    // Local file header: method 8 (raw deflate).
-    append32(zip, 0x04034b50);
-    append16(zip, 20); append16(zip, 0); append16(zip, 8);
-    append16(zip, 0); append16(zip, 0);
-    append32(zip, crc); append32(zip, compressedSize);
-    append32(zip, originalSize);
-    append16(zip, static_cast<uint16_t>(entry.size()));
-    append16(zip, 0);
-    zip.insert(zip.end(), entry.begin(), entry.end());
-    zip.insert(zip.end(), compressed.begin(), compressed.end());
+    // ZIP32 single-entry archive. Constant header fields are defined once;
+    // only CRC, sizes, and offsets are patched below.
+    static const char localTemplate[30] = {
+        0x50, 0x4b, 0x03, 0x04,  20, 0,  0, 0,  8, 0,
+        0, 0,  0, 0,           0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,            8, 0,  0, 0
+    };
+    static const char centralTemplate[46] = {
+        0x50, 0x4b, 0x01, 0x02,  20, 0,  20, 0,  0, 0,
+        8, 0,  0, 0,  0, 0,     0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,             8, 0,  0, 0,  0, 0,
+        0, 0,  0, 0,            0, 0, 0, 0,  0, 0, 0, 0
+    };
+    static const char endTemplate[22] = {
+        0x50, 0x4b, 0x05, 0x06,  0, 0,  0, 0,
+        1, 0,  1, 0,           0, 0, 0, 0,
+        0, 0, 0, 0,            0, 0
+    };
 
-    const uint32_t centralOffset = as32(zip.size());
-    append32(zip, 0x02014b50);
-    append16(zip, 20); append16(zip, 20);
-    append16(zip, 0); append16(zip, 8);
-    append16(zip, 0); append16(zip, 0);
-    append32(zip, crc); append32(zip, compressedSize);
-    append32(zip, originalSize);
-    append16(zip, static_cast<uint16_t>(entry.size()));
-    append16(zip, 0); append16(zip, 0);
-    append16(zip, 0); append16(zip, 0);
-    append32(zip, 0); append32(zip, 0);
-    zip.insert(zip.end(), entry.begin(), entry.end());
-    const uint32_t centralSize = as32(zip.size() - centralOffset);
-    append32(zip, 0x06054b50);
-    append16(zip, 0); append16(zip, 0);
-    append16(zip, 1); append16(zip, 1);
-    append32(zip, centralSize); append32(zip, centralOffset);
-    append16(zip, 0);
+    QByteArray local(localTemplate, sizeof(localTemplate));
+    QByteArray central(centralTemplate, sizeof(centralTemplate));
+    QByteArray ending(endTemplate, sizeof(endTemplate));
+
+    setLe32(local, 14, crc);
+    setLe32(local, 18, compressedSize);
+    setLe32(local, 22, originalSize);
+
+    setLe32(central, 16, crc);
+    setLe32(central, 20, compressedSize);
+    setLe32(central, 24, originalSize);
+
+    const size_t centralOffsetSize =
+        local.size() + entry.size() + compressed.size();
+    const uint32_t centralOffset = as32(centralOffsetSize);
+    const uint32_t centralSize = as32(central.size() + entry.size());
+    require(centralOffsetSize + centralSize + ending.size() <= UINT32_MAX,
+            "ZIP32 archive too large");
+
+    setLe32(ending, 12, centralSize);
+    setLe32(ending, 16, centralOffset);
+
+    std::vector<uint8_t> zip;
+    zip.reserve(centralOffsetSize + centralSize + ending.size());
+    const auto addBytes = [&zip](const char* data, size_t count) {
+        zip.insert(zip.end(),
+                   reinterpret_cast<const uint8_t*>(data),
+                   reinterpret_cast<const uint8_t*>(data) + count);
+    };
+    addBytes(local.constData(), static_cast<size_t>(local.size()));
+    addBytes(entry.data(), entry.size());
+    zip.insert(zip.end(), compressed.begin(), compressed.end());
+    addBytes(central.constData(), static_cast<size_t>(central.size()));
+    addBytes(entry.data(), entry.size());
+    addBytes(ending.constData(), static_cast<size_t>(ending.size()));
 
     std::ofstream file(filename.c_str(), std::ios::binary | std::ios::trunc);
     require(file.is_open(), "Cannot open NPZ output file");
