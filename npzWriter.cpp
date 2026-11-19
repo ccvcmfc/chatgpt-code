@@ -19,7 +19,6 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -75,8 +74,8 @@ int renderClip(const ClipPolygons& layers,
             clipUm > 0 && pixelUm > 0 && dbuUm > 0))
         return -1;
     const double hFloat = clipUm / pixelUm;
-    if (!(hFloat >= 1 && hFloat <= static_cast<double>(INT32_MAX)))
-        return -1;
+    if (!std::isfinite(hFloat) || hFloat < 1 || hFloat > INT32_MAX)
+        return -2;
     const int h = static_cast<int>(hFloat); // matches Python int(...)
     int64_t x0d = 0, y0d = 0;
     if (!checkedTrunc((centerXUm - clipUm / 2.0) / dbuUm, x0d) ||
@@ -173,6 +172,146 @@ static std::vector<uint8_t> makeNpy(const Raster& r) {
 }
 
 static int deflateRaw(const std::vector<uint8_t>& src, std::vector<uint8_t>& out) {
+    z_stream zs;
+    std::memset(&zs, 0, sizeof(zs));
+    if (!(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                         -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK))
+        return -4;
+    out.clear();
+    uint8_t buffer[65536];
+    size_t inputOffset = 0;
+    int status = Z_OK;
+    do {
+        if (zs.avail_in == 0 && inputOffset < src.size()) {
+            const size_t n = std::min<size_t>(
+                src.size() - inputOffset, 65536);
+            zs.next_in = const_cast<Bytef*>(src.data() + inputOffset);
+            zs.avail_in = static_cast<uInt>(n);
+            inputOffset += n;
+        }
+        const int flush = (inputOffset == src.size() && zs.avail_in == 0)
+                        ? Z_FINISH : Z_NO_FLUSH;
+        zs.next_out = buffer;
+        zs.avail_out = sizeof(buffer);
+        status = deflate(&zs, flush);
+        if (status != Z_OK && status != Z_STREAM_END) {
+            deflateEnd(&zs);
+            return -4;
+        }
+        out.insert(out.end(), buffer, buffer + sizeof(buffer) - zs.avail_out);
+    } while (status != Z_STREAM_END);
+    deflateEnd(&zs);
+    return 0;
+}
+
+int saveNpz(const std::string& filename, const Raster& raster) {
+    std::vector<uint8_t> npy, compressed;
+    int rc = makeNpy(raster, npy);
+    if (rc < 0) return rc;
+    rc = deflateRaw(npy, compressed);
+    if (rc < 0) return rc;
+    if (npy.size() > UINT32_MAX || compressed.size() > UINT32_MAX) return -2;
+    const uint32_t originalSize = static_cast<uint32_t>(npy.size());
+    const uint32_t compressedSize = static_cast<uint32_t>(compressed.size());
+    const std::string entry = "data.npy";
+    uint32_t crc = crc32(0L, Z_NULL, 0);
+    for (size_t i = 0; i < npy.size(); i += 65536) {
+        const size_t n = std::min<size_t>(65536, npy.size() - i);
+        crc = crc32(crc, npy.data() + i, static_cast<uInt>(n));
+    }
+
+    // ZIP32 single-entry archive. Constant header fields are defined once;
+    // only CRC, sizes, and offsets are patched below.
+    static const char localTemplate[30] = {
+        0x50, 0x4b, 0x03, 0x04,  20, 0,  0, 0,  8, 0,
+        0, 0,  0, 0,           0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,            8, 0,  0, 0
+    };
+    static const char centralTemplate[46] = {
+        0x50, 0x4b, 0x01, 0x02,  20, 0,  20, 0,  0, 0,
+        8, 0,  0, 0,  0, 0,     0, 0, 0, 0,  0, 0, 0, 0,
+        0, 0, 0, 0,             8, 0,  0, 0,  0, 0,
+        0, 0,  0, 0,            0, 0, 0, 0,  0, 0, 0, 0
+    };
+    static const char endTemplate[22] = {
+        0x50, 0x4b, 0x05, 0x06,  0, 0,  0, 0,
+        1, 0,  1, 0,           0, 0, 0, 0,
+        0, 0, 0, 0,            0, 0
+    };
+
+    QByteArray local(localTemplate, sizeof(localTemplate));
+    QByteArray central(centralTemplate, sizeof(centralTemplate));
+    QByteArray ending(endTemplate, sizeof(endTemplate));
+
+    setLe32(local, 14, crc);
+    setLe32(local, 18, compressedSize);
+    setLe32(local, 22, originalSize);
+
+    setLe32(central, 16, crc);
+    setLe32(central, 20, compressedSize);
+    setLe32(central, 24, originalSize);
+
+    const size_t centralOffsetSize =
+        local.size() + entry.size() + compressed.size();
+    if (centralOffsetSize > UINT32_MAX || central.size() + entry.size() > UINT32_MAX) return -2;
+    const uint32_t centralOffset = static_cast<uint32_t>(centralOffsetSize);
+    const uint32_t centralSize = static_cast<uint32_t>(central.size() + entry.size());
+    if (centralOffsetSize + centralSize + ending.size() > UINT32_MAX)
+        return -2;
+
+    setLe32(ending, 12, centralSize);
+    setLe32(ending, 16, centralOffset);
+
+    // Write directly to a temporary file and atomically commit on success.
+    // Avoid a second full-size ZIP buffer in memory.
+    QSaveFile file(QString::fromStdString(filename));
+    if (!file.open(QIODevice::WriteOnly))
+        return -5;
+
+    const auto writeBytes = [&file](const char* data, size_t count) -> bool {
+        return count <= static_cast<size_t>(std::numeric_limits<qint64>::max()) &&
+            file.write(data, static_cast<qint64>(count)) == static_cast<qint64>(count);
+    };
+
+    if (!writeBytes(local.constData(), static_cast<size_t>(local.size())) ||
+        !writeBytes(entry.data(), entry.size()) ||
+        !writeBytes(reinterpret_cast<const char*>(compressed.data()), compressed.size()) ||
+        !writeBytes(central.constData(), static_cast<size_t>(central.size())) ||
+        !writeBytes(entry.data(), entry.size()) ||
+        !writeBytes(ending.constData(), static_cast<size_t>(ending.size()))) {
+        file.cancelWriting();
+        return -5;
+    }
+    if (!file.commit()) return -5;
+    return 0;
+}
+
+int clipFilename(int clipId, std::string& filename) {
+    if (clipId < 0) return -1;
+    char name[64];
+    std::snprintf(name, sizeof(name), "clip_%05d.npz", clipId);
+    filename = name;
+    return 0;
+}
+
+int writeClip(int clipId, const ClipPolygons& layers,
+              double centerXUm, double centerYUm,
+              double clipUm, double pixelUm, double dbuUm) {
+    std::string filename;
+    int rc = clipFilename(clipId, filename);
+    if (rc < 0) return rc;
+    Raster raster;
+    rc = renderClip(layers, centerXUm, centerYUm, clipUm, pixelUm, dbuUm, raster);
+    if (rc < 0) return rc;
+    return saveNpz(filename, raster);
+}
+
+} // namespace clipnpz
+
+// int rc = clipnpz::writeClip(0, layers, x_um, y_um, clip_um, pixel_um, dbu_um);
+// 0=success; -1=invalid argument; -2=size; -3=coordinates;
+// -4=zlib; -5=file I/O; -6=NPY/ZIP format.
+// Note: OpenCV and STL may still throw internally (e.g. allocation failure).static int deflateRaw(const std::vector<uint8_t>& src, std::vector<uint8_t>& out) {
     z_stream zs;
     std::memset(&zs, 0, sizeof(zs));
     if (!(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
