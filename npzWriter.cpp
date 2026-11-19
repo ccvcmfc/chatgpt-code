@@ -166,11 +166,10 @@ static int makeNpyHeader(const Raster& r, std::vector<uint8_t>& npyHeader) {
         return -2; // NPY buffer size overflow
     npyHeader.reserve(prefixSize);
     const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
-    npyHeader.insert(npy.end(), magic, magic + sizeof(magic));
+    npyHeader.insert(npyHeader.end(), magic, magic + sizeof(magic));
     npyHeader.push_back(static_cast<uint8_t>(header.size() & 0xff));
     npyHeader.push_back(static_cast<uint8_t>((header.size() >> 8) & 0xff));
-    npyHeader.insert(npy.end(), header.begin(), header.end());
-    npyHeader.insert(npy.end(), r.pixels.begin(), r.pixels.end());
+    npyHeader.insert(npyHeader.end(), header.begin(), header.end());
     return 0;
 }
 
