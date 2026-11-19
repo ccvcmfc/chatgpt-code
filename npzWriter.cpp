@@ -146,7 +146,7 @@ static void setLe32(QByteArray& bytes, int offset, quint32 value) {
     qToLittleEndian<quint32>(value,
         reinterpret_cast<uchar*>(bytes.data() + offset));
 }
-static int makeNpy(const Raster& r, std::vector<uint8_t>& npy) {
+static int makeNpyHeader(const Raster& r, std::vector<uint8_t>& npyHeader) {
     size_t plane = 0, total = 0;
     if (!checkedMul(r.height, r.width, plane) ||
         !checkedMul(r.channels, plane, total) || r.pixels.size() != total)
@@ -160,54 +160,68 @@ static int makeNpy(const Raster& r, std::vector<uint8_t>& npy) {
     header.push_back('\n');
     if (header.size() > UINT16_MAX)
         return -6; // NPY header format limit
-    npy.clear();
+    npyHeader.clear();
     const size_t prefixSize = 10 + header.size();
     if (prefixSize > std::numeric_limits<size_t>::max() - r.pixels.size())
         return -2; // NPY buffer size overflow
-    npy.reserve(prefixSize + r.pixels.size());
+    npyHeader.reserve(prefixSize);
     const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
-    npy.insert(npy.end(), magic, magic + sizeof(magic));
-    npy.push_back(static_cast<uint8_t>(header.size() & 0xff));
-    npy.push_back(static_cast<uint8_t>((header.size() >> 8) & 0xff));
-    npy.insert(npy.end(), header.begin(), header.end());
-    npy.insert(npy.end(), r.pixels.begin(), r.pixels.end());
+    npyHeader.insert(npy.end(), magic, magic + sizeof(magic));
+    npyHeader.push_back(static_cast<uint8_t>(header.size() & 0xff));
+    npyHeader.push_back(static_cast<uint8_t>((header.size() >> 8) & 0xff));
+    npyHeader.insert(npy.end(), header.begin(), header.end());
+    npyHeader.insert(npy.end(), r.pixels.begin(), r.pixels.end());
     return 0;
 }
 
-static int deflateRaw(const std::vector<uint8_t>& src, std::vector<uint8_t>& out) {
+// Read the NPY header and Raster pixels directly, without concatenating them.
+static int deflateRaw(const std::vector<uint8_t>& npyHeader,
+                      const std::vector<uint8_t>& pixels,
+                      std::vector<uint8_t>& out) {
+    if (npyHeader.size() > std::numeric_limits<size_t>::max() - pixels.size())
+        return -2; // NPY input size overflow
+    const size_t inputSize = npyHeader.size() + pixels.size();
+
     z_stream zs;
     std::memset(&zs, 0, sizeof(zs));
-    if (!(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
-                         -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK))
-        return -4; // zlib compression failure
+    if (deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                     -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        return -4; // zlib initialization failed
+
     out.clear();
-    // Reserve a zlib upper bound to avoid repeated vector reallocations.
-    // deflateBound uses uLong; keep chunked compression for larger inputs.
-    if (src.size() <= static_cast<size_t>(std::numeric_limits<uLong>::max())) {
-        const uLong upperBound = deflateBound(&zs, static_cast<uLong>(src.size()));
+    if (inputSize <= static_cast<size_t>(std::numeric_limits<uLong>::max())) {
+        const uLong upperBound = deflateBound(&zs, static_cast<uLong>(inputSize));
         if (static_cast<uint64_t>(upperBound) <=
             static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
             out.reserve(static_cast<size_t>(upperBound));
     }
+
     uint8_t buffer[65536];
-    size_t inputOffset = 0;
+    size_t headerOffset = 0;
+    size_t pixelOffset = 0;
     int status = Z_OK;
     do {
-        if (zs.avail_in == 0 && inputOffset < src.size()) {
-            const size_t n = std::min<size_t>(
-                src.size() - inputOffset, 65536);
-            zs.next_in = const_cast<Bytef*>(src.data() + inputOffset);
-            zs.avail_in = static_cast<uInt>(n);
-            inputOffset += n;
+        if (zs.avail_in == 0) {
+            if (headerOffset < npyHeader.size()) {
+                const size_t count = std::min<size_t>(65536, npyHeader.size() - headerOffset);
+                zs.next_in = const_cast<Bytef*>(npyHeader.data() + headerOffset);
+                zs.avail_in = static_cast<uInt>(count);
+                headerOffset += count;
+            } else if (pixelOffset < pixels.size()) {
+                const size_t count = std::min<size_t>(65536, pixels.size() - pixelOffset);
+                zs.next_in = const_cast<Bytef*>(pixels.data() + pixelOffset);
+                zs.avail_in = static_cast<uInt>(count);
+                pixelOffset += count;
+            }
         }
-        const int flush = (inputOffset == src.size() && zs.avail_in == 0)
-                        ? Z_FINISH : Z_NO_FLUSH;
+        const bool allInputConsumed = headerOffset == npyHeader.size() &&
+            pixelOffset == pixels.size() && zs.avail_in == 0;
         zs.next_out = buffer;
         zs.avail_out = sizeof(buffer);
-        status = deflate(&zs, flush);
+        status = deflate(&zs, allInputConsumed ? Z_FINISH : Z_NO_FLUSH);
         if (status != Z_OK && status != Z_STREAM_END) {
             deflateEnd(&zs);
-            return -4; // zlib compression failure
+            return -4; // zlib compression failed
         }
         out.insert(out.end(), buffer, buffer + sizeof(buffer) - zs.avail_out);
     } while (status != Z_STREAM_END);
@@ -219,13 +233,14 @@ static int deflateRaw(const std::vector<uint8_t>& src, std::vector<uint8_t>& out
 // A small archive keeps the ZIP32 layout for compatibility with older readers.
 int saveNpz(const std::string& filename, const Raster& raster,
             bool allowZip64 = true) {
-    std::vector<uint8_t> npy, compressed;
-    int rc = makeNpy(raster, npy);
+    std::vector<uint8_t> npyHeader, compressed;
+    int rc = makeNpyHeader(raster, npyHeader);
     if (rc < 0) return rc; // NPY construction failed
-    rc = deflateRaw(npy, compressed);
+    rc = deflateRaw(npyHeader, raster.pixels, compressed);
     if (rc < 0) return rc; // DEFLATE compression failed
 
-    const quint64 originalSize = static_cast<quint64>(npy.size());
+    const quint64 originalSize = static_cast<quint64>(npyHeader.size()) +
+        static_cast<quint64>(raster.pixels.size());
     const quint64 compressedSize = static_cast<quint64>(compressed.size());
     const QByteArray entry("data.npy");
     const quint64 filenameLength = static_cast<quint64>(entry.size());
@@ -250,9 +265,13 @@ int saveNpz(const std::string& filename, const Raster& raster,
         return -2; // ZIP archive size overflow
 
     quint32 crc = crc32(0L, Z_NULL, 0);
-    for (size_t i = 0; i < npy.size(); i += 65536) {
-        const size_t n = std::min<size_t>(65536, npy.size() - i);
-        crc = crc32(crc, npy.data() + i, static_cast<uInt>(n));
+    for (size_t i = 0; i < npyHeader.size(); i += 65536) {
+        const size_t count = std::min<size_t>(65536, npyHeader.size() - i);
+        crc = crc32(crc, npyHeader.data() + i, static_cast<uInt>(count));
+    }
+    for (size_t i = 0; i < raster.pixels.size(); i += 65536) {
+        const size_t count = std::min<size_t>(65536, raster.pixels.size() - i);
+        crc = crc32(crc, raster.pixels.data() + i, static_cast<uInt>(count));
     }
 
     QByteArray local(30, '\0');
