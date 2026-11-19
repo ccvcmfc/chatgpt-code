@@ -10,13 +10,14 @@
 #include <zlib.h>
 #include <QByteArray>
 #include <QtEndian>
+#include <QSaveFile>
+#include <QString>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -32,7 +33,7 @@ static const int SHIFT_BITS = 5;
 static const int SHIFT_MULT = 1 << SHIFT_BITS;
 
 static size_t checkedMul(size_t a, size_t b) {
-    if (!(b == 0 || a <= std::numeric_limits<size_t>::max() / b))
+    if (b != 0 && a > std::numeric_limits<size_t>::max() / b)
         throw std::runtime_error("Size overflow");
     return a * b;
 }
@@ -42,7 +43,11 @@ static int checkedCvCoord(double x) {
             x <= static_cast<double>(std::numeric_limits<int32_t>::max())))
         throw std::runtime_error("OpenCV fixed-point coordinate out of int32 range");
     // np.round uses round-to-nearest-even; nearbyint matches under FE_TONEAREST.
-    return static_cast<int>(std::nearbyint(x));
+    const double rounded = std::nearbyint(x);
+    if (rounded < static_cast<double>(INT32_MIN) ||
+        rounded > static_cast<double>(INT32_MAX))
+        throw std::runtime_error("Rounded OpenCV coordinate out of range");
+    return static_cast<int>(rounded);
 }
 static int64_t checkedTrunc(double x) {
     if (!(std::isfinite(x) &&
@@ -72,6 +77,8 @@ Raster renderClip(const ClipPolygons& layers,
     const int64_t x0d = checkedTrunc((centerXUm - clipUm / 2.0) / dbuUm);
     const int64_t y0d = checkedTrunc((centerYUm - clipUm / 2.0) / dbuUm);
     const double scale = dbuUm / pixelUm * SHIFT_MULT;
+    if (!std::isfinite(scale) || scale <= 0)
+        throw std::runtime_error("Invalid raster scale");
 
     Raster result;
     result.channels = layers.size();
@@ -120,16 +127,12 @@ Raster renderClip(const ClipPolygons& layers,
 }
 
 // Patch little-endian numeric fields in a fixed binary header.
-static void setLe16(QByteArray& bytes, int offset, quint16 value) {
-    qToLittleEndian<quint16>(value,
-        reinterpret_cast<uchar*>(bytes.data() + offset));
-}
 static void setLe32(QByteArray& bytes, int offset, quint32 value) {
     qToLittleEndian<quint32>(value,
         reinterpret_cast<uchar*>(bytes.data() + offset));
 }
 static uint32_t as32(size_t n) {
-    if (!(n <= UINT32_MAX))
+    if (n > UINT32_MAX)
         throw std::runtime_error("ZIP32 limit exceeded; ZIP64 not implemented");
     return static_cast<uint32_t>(n);
 }
@@ -144,10 +147,13 @@ static std::vector<uint8_t> makeNpy(const Raster& r) {
     const size_t padding = (16 - ((10 + header.size() + 1) % 16)) % 16;
     header.append(padding, ' ');
     header.push_back('\n');
-    if (!(header.size() <= UINT16_MAX))
+    if (header.size() > UINT16_MAX)
         throw std::runtime_error("NPY v1 header too large");
     std::vector<uint8_t> npy;
-    npy.reserve(10 + header.size() + r.pixels.size());
+    const size_t prefixSize = 10 + header.size();
+    if (r.pixels.size() > UINT32_MAX - prefixSize)
+        throw std::runtime_error("NPY exceeds ZIP32 size limit");
+    npy.reserve(prefixSize + r.pixels.size());
     const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0};
     npy.insert(npy.end(), magic, magic + sizeof(magic));
     npy.push_back(static_cast<uint8_t>(header.size() & 0xff));
@@ -237,37 +243,38 @@ void saveNpz(const std::string& filename, const Raster& raster) {
         local.size() + entry.size() + compressed.size();
     const uint32_t centralOffset = as32(centralOffsetSize);
     const uint32_t centralSize = as32(central.size() + entry.size());
-    if (!(centralOffsetSize + centralSize + ending.size() <= UINT32_MAX))
+    if (centralOffsetSize + centralSize + ending.size() > UINT32_MAX)
         throw std::runtime_error("ZIP32 archive too large");
 
     setLe32(ending, 12, centralSize);
     setLe32(ending, 16, centralOffset);
 
-    std::vector<uint8_t> zip;
-    zip.reserve(centralOffsetSize + centralSize + ending.size());
-    const auto addBytes = [&zip](const char* data, size_t count) {
-        zip.insert(zip.end(),
-                   reinterpret_cast<const uint8_t*>(data),
-                   reinterpret_cast<const uint8_t*>(data) + count);
-    };
-    addBytes(local.constData(), static_cast<size_t>(local.size()));
-    addBytes(entry.data(), entry.size());
-    zip.insert(zip.end(), compressed.begin(), compressed.end());
-    addBytes(central.constData(), static_cast<size_t>(central.size()));
-    addBytes(entry.data(), entry.size());
-    addBytes(ending.constData(), static_cast<size_t>(ending.size()));
-
-    std::ofstream file(filename.c_str(), std::ios::binary | std::ios::trunc);
-    if (!(file.is_open()))
+    // Write directly to a temporary file and atomically commit on success.
+    // Avoid a second full-size ZIP buffer in memory.
+    QSaveFile file(QString::fromStdString(filename));
+    if (!file.open(QIODevice::WriteOnly))
         throw std::runtime_error("Cannot open NPZ output file");
-    file.write(reinterpret_cast<const char*>(zip.data()),
-               static_cast<std::streamsize>(zip.size()));
-    if (!(file.good()))
-        throw std::runtime_error("Failed writing NPZ");
+
+    const auto writeBytes = [&file](const char* data, size_t count) {
+        if (count > static_cast<size_t>(std::numeric_limits<qint64>::max()) ||
+            file.write(data, static_cast<qint64>(count)) !=
+                static_cast<qint64>(count))
+            throw std::runtime_error("Failed writing NPZ");
+    };
+
+    writeBytes(local.constData(), static_cast<size_t>(local.size()));
+    writeBytes(entry.data(), entry.size());
+    writeBytes(reinterpret_cast<const char*>(compressed.data()), compressed.size());
+    writeBytes(central.constData(), static_cast<size_t>(central.size()));
+    writeBytes(entry.data(), entry.size());
+    writeBytes(ending.constData(), static_cast<size_t>(ending.size()));
+
+    if (!file.commit())
+        throw std::runtime_error("Failed committing NPZ output");
 }
 
 std::string clipFilename(int clipId) {
-    if (!(clipId >= 0))
+    if (clipId < 0)
         throw std::runtime_error("clipId must be nonnegative");
     char name[64];
     std::snprintf(name, sizeof(name), "clip_%05d.npz", clipId);
