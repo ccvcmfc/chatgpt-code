@@ -181,6 +181,14 @@ static int deflateRaw(const std::vector<uint8_t>& src, std::vector<uint8_t>& out
                          -MAX_WBITS, 8, Z_DEFAULT_STRATEGY) == Z_OK))
         return -4; // zlib compression failure
     out.clear();
+    // Reserve a zlib upper bound to avoid repeated vector reallocations.
+    // deflateBound uses uLong; keep chunked compression for larger inputs.
+    if (src.size() <= static_cast<size_t>(std::numeric_limits<uLong>::max())) {
+        const uLong upperBound = deflateBound(&zs, static_cast<uLong>(src.size()));
+        if (static_cast<uint64_t>(upperBound) <=
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max()))
+            out.reserve(static_cast<size_t>(upperBound));
+    }
     uint8_t buffer[65536];
     size_t inputOffset = 0;
     int status = Z_OK;
