@@ -230,8 +230,7 @@ static int deflateRaw(const std::vector<uint8_t>& npyHeader,
 
 // ZIP64 is allowed only when requested and required by the actual sizes.
 // A small archive keeps the ZIP32 layout for compatibility with older readers.
-int saveNpz(const std::string& filename, const Raster& raster,
-            bool allowZip64 = true) {
+int saveNpz(const std::string& filename, const Raster& raster) {
     std::vector<uint8_t> npyHeader, compressed;
     int rc = makeNpyHeader(raster, npyHeader);
     if (rc < 0) return rc; // NPY construction failed
@@ -253,8 +252,6 @@ int saveNpz(const std::string& filename, const Raster& raster,
         originalSize >= zip32Maximum ||
         compressedSize >= zip32Maximum ||
         compressedSize > zip32Maximum - localBase - centralBase - 22;
-    if (useZip64 && !allowZip64)
-        return -2; // ZIP64 required but disabled
 
     const quint64 localExtraSize = useZip64 ? 20 : 0;
     const quint64 centralExtraSize = useZip64 ? 20 : 0;
@@ -371,15 +368,14 @@ int clipFilename(int clipId, std::string& filename) {
 
 int writeClip(int clipId, const ClipPolygons& layers,
               double centerXUm, double centerYUm,
-              double clipUm, double pixelUm, double dbuUm,
-              bool allowZip64 = true) {
+              double clipUm, double pixelUm, double dbuUm) {
     std::string filename;
     int rc = clipFilename(clipId, filename);
     if (rc < 0) return rc;
     Raster raster;
     rc = renderClip(layers, centerXUm, centerYUm, clipUm, pixelUm, dbuUm, raster);
     if (rc < 0) return rc;
-    return saveNpz(filename, raster, allowZip64); // propagate save status (0 or negative)
+    return saveNpz(filename, raster); // propagate save status (0 or negative)
 }
 
 } // namespace clipnpz
