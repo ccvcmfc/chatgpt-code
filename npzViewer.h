@@ -28,6 +28,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <utility>
 
 // Expects mask.channels, mask.height, mask.width, mask.pixels,
 // and optionally mask.layerIds. Pixels must be contiguous C-order CHW uint8.
@@ -37,7 +39,16 @@ template <typename Mask>
 class NpzChannelViewer : public QDialog {
 public:
     explicit NpzChannelViewer(const Mask& mask, QWidget* parent = nullptr)
-        : QDialog(parent), mask_(mask), scene_(new QGraphicsScene(this)),
+        : NpzChannelViewer(std::shared_ptr<const Mask>(), mask, parent) {}
+
+    explicit NpzChannelViewer(std::shared_ptr<const Mask> mask,
+                              QWidget* parent = nullptr)
+        : NpzChannelViewer(mask, *mask, parent) {}
+
+private:
+    NpzChannelViewer(std::shared_ptr<const Mask> ownedMask, const Mask& mask,
+                     QWidget* parent)
+        : QDialog(parent), ownedMask_(std::move(ownedMask)), mask_(mask), scene_(new QGraphicsScene(this)),
           view_(new QGraphicsView(scene_, this)),
           channels_(new QComboBox(this)), aaOnly_(new QCheckBox(QStringLiteral("Highlight AA (1-254)"), this)), status_(new QLabel(this)) {
         setWindowTitle(QStringLiteral("NPZ Channel Viewer"));
@@ -180,6 +191,7 @@ private:
                          .arg(static_cast<qulonglong>(h)));
     }
 
+    std::shared_ptr<const Mask> ownedMask_;
     const Mask& mask_;
     QGraphicsScene* scene_;
     QGraphicsView* view_;
@@ -196,6 +208,20 @@ template <typename Mask>
 inline void showNpzViewer(const Mask& mask, QWidget* parent = nullptr) {
     NpzChannelViewer<Mask> viewer(mask, parent);
     viewer.exec();
+}
+
+// Non-modal, independently closable window. Moves mask data into a viewer-owned
+// shared_ptr; no additional pixel-buffer copy when called with std::move(mask).
+// Caller may continue parsing and opening more NPZ files.
+template <typename Mask>
+inline NpzChannelViewer<Mask>* showNpzViewerMulti(
+    Mask mask, QWidget* parent = nullptr) {
+    std::shared_ptr<const Mask> owned(new Mask(std::move(mask)));
+    NpzChannelViewer<Mask>* viewer = new NpzChannelViewer<Mask>(owned, parent);
+    viewer->setAttribute(Qt::WA_DeleteOnClose);
+    viewer->setWindowFlag(Qt::Window, true);
+    viewer->show();
+    return viewer;
 }
 
 #endif // NPZ_VIEWER_H
