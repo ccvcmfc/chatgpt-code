@@ -201,8 +201,8 @@ protected:
                     double size=coords_[2]->text().toDouble(&ok[2]);
                     double pitch=coords_[3]->text().toDouble(&ok[3]);
                     if(ok[0]&&ok[1]&&ok[2]&&ok[3]&&std::isfinite(sx)&&std::isfinite(sy)&&std::isfinite(size)&&std::isfinite(pitch)&&size>0&&pitch>0) {
-                        double ux=sx+double(x)*pitch;
-                        double uy=sy+double(a_->height-1-y)*pitch;
+                        double ux=sx-size/2.0+double(x)*pitch;
+                        double uy=sy-size/2.0+double(a_->height-1-y)*pitch;
                         msg+=tr(" | um: (%1, %2)").arg(ux,0,'f',9).arg(uy,0,'f',9);
                         if(std::abs(size-double(a_->width)*pitch)>pitch*1e-6 ||
                            std::abs(size-double(a_->height)*pitch)>pitch*1e-6)
@@ -219,7 +219,7 @@ protected:
     }
 public:
     explicit NpzCompareViewer(QWidget* parent=nullptr):QDialog(parent) {
-        setWindowTitle(tr("NPZ Compare Viewer - Refresh / Grid / um"));resize(1200,800);
+        setWindowTitle(tr("NPZ Compare Viewer - Center / Grid / Refresh"));resize(1200,800);
         auto* layout=new QVBoxLayout(this);
         for(int i=0;i<2;++i) {
             auto* row=new QHBoxLayout;
@@ -230,10 +230,12 @@ public:
             layout->addLayout(row);
         }
         auto* coordinates=new QHBoxLayout;
-        const char* names[]={"Start X (um)","Start Y (um)","Size (um)","um_per_pixel"};
+        const char* names[]={"Center X (um)","Center Y (um)","Size (um)","um_per_pixel"};
         for(int i=0;i<4;++i) {
             coordinates->addWidget(new QLabel(QString::fromLatin1(names[i]),this));
             coords_[i]=new QLineEdit(this);
+            coords_[i]->setFocusPolicy(Qt::StrongFocus);
+            coords_[i]->setReadOnly(false);
             coords_[i]->setMaximumWidth(120);
             coords_[i]->setPlaceholderText(i<2?"0.0":"Required");
             if(i<2) coords_[i]->setText("0");
