@@ -11,12 +11,39 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
+#include <cmath>
+
+// Grid is drawn in scene coordinates, without modifying image pixels.
+class NpzCompareGridView : public QGraphicsView {
+public:
+    bool gridEnabled = true;
+    explicit NpzCompareGridView(QGraphicsScene* scene, QWidget* parent)
+        : QGraphicsView(scene,parent) {}
+protected:
+    void drawForeground(QPainter* p, const QRectF& exposed) override {
+        QGraphicsView::drawForeground(p,exposed);
+        if (!gridEnabled || transform().m11()<8.0 || !scene()) return;
+        const QRectF r=exposed.intersected(scene()->sceneRect());
+        if (r.isEmpty()) return;
+        p->save();
+        p->setRenderHint(QPainter::Antialiasing,false);
+        QPen pen(QColor(110,110,110,150)); pen.setCosmetic(true); pen.setWidth(0);
+        p->setPen(pen);
+        for (qreal x=std::ceil(r.left());x<=r.right();x+=1.0)
+            p->drawLine(QLineF(x,r.top(),x,r.bottom()));
+        for (qreal y=std::ceil(r.top());y<=r.bottom();y+=1.0)
+            p->drawLine(QLineF(r.left(),y,r.right(),y));
+        p->restore();
+    }
+};
 
 class NpzCompareViewer : public QDialog {
     struct Stats { quint64 diff=0, onlyA=0, onlyB=0, other=0; int maxDiff=0; QRect bounds; };
     std::unique_ptr<NpzMask> a_, b_;
     QLineEdit* paths_[2];
-    QGraphicsView* views_[3];
+    NpzCompareGridView* views_[3] = {nullptr,nullptr,nullptr};
+    QLineEdit* coord_[4];
+    QLabel* coordStatus_;
     QGraphicsScene* scenes_[3];
     QTableWidget* table_;
     QLabel* status_;
@@ -151,8 +178,26 @@ protected:
                     size_t i=(size_t(channel_)*a_->height+y)*a_->width+x;
                     int v=a_->pixels[i],u=b_->pixels[i];
                     status_->setText(tr("X: %1 Y: %2 | A: %3 B: %4 | A-B: %5").arg(qulonglong(x)).arg(qulonglong(y)).arg(v).arg(u).arg(v-u));
-                }
-            }
+                    bool ok[4]; double d[4];
+                    for(int j=0;j<4;++j) d[j]=coord_[j]->text().toDouble(&ok[j]);
+                    bool validCoords=true;
+                    for(int j=0;j<4;++j) validCoords=validCoords&&ok[j]&&std::isfinite(d[j]);
+                    QString tip=status_->text();
+                    if(validCoords && d[2]>0 && d[3]>0) {
+                        // Pixel sample coordinates: original unflipped index,
+                        // no half-pixel offset. Origin is center minus size/2.
+                        const double ux=d[0]-d[2]/2.0+double(x)*d[3];
+                        const double uy=d[1]-d[2]/2.0+double(a_->height-1-y)*d[3];
+                        const QString pos=tr("Layout X: %1 um | Y: %2 um")
+                            .arg(ux,0,'f',9).arg(uy,0,'f',9);
+                        coordStatus_->setText(pos);
+                        tip+=QStringLiteral("\n")+pos;
+                    } else {
+                        coordStatus_->setText(tr("Enter center X/Y, size and um_per_pixel"));
+                    }
+                    QToolTip::showText(static_cast<QMouseEvent*>(e)->globalPos(),tip,views_[k]->viewport());
+                } else { QToolTip::hideText(); coordStatus_->clear(); }
+            } else if(e->type()==QEvent::Leave) { QToolTip::hideText(); coordStatus_->clear(); }
         }
         return QDialog::eventFilter(obj,e);
     }
@@ -168,6 +213,20 @@ public:
             connect(btn,&QPushButton::clicked,this,[this,i](){browse(i);});
             layout->addLayout(row);
         }
+        auto* coordinates=new QHBoxLayout;
+        const char* names[]={"Point X (um)","Point Y (um)","Size (um)","um_per_pixel"};
+        for(int i=0;i<4;++i) {
+            coordinates->addWidget(new QLabel(QString::fromLatin1(names[i]),this));
+            coord_[i]=new QLineEdit(this);
+            coord_[i]->setMaximumWidth(130);
+            coordinates->addWidget(coord_[i]);
+        }
+        auto* grid=new QCheckBox(tr("Show Grid"),this);
+        grid->setChecked(true);
+        coordinates->addWidget(grid);
+        layout->addLayout(coordinates);
+        coordStatus_=new QLabel(tr("Enter center X/Y, size and um_per_pixel"),this);
+        layout->addWidget(coordStatus_);
         auto* buttons=new QHBoxLayout;
         auto* run=new QPushButton(tr("Compare"),this);
         auto* full=new QPushButton(tr("Fit"),this);
@@ -186,7 +245,7 @@ public:
             auto* col=new QVBoxLayout;
             col->addWidget(new QLabel(k==0?"File A":k==1?"File B":"Difference",this));
             scenes_[k]=new QGraphicsScene(this);
-            views_[k]=new QGraphicsView(scenes_[k],this);
+            views_[k]=new NpzCompareGridView(scenes_[k],this);
             views_[k]->setDragMode(QGraphicsView::ScrollHandDrag);
             views_[k]->setTransformationAnchor(QGraphicsView::AnchorUnderMouse);
             views_[k]->viewport()->setMouseTracking(true);
@@ -197,6 +256,7 @@ public:
             connect(views_[k]->horizontalScrollBar(),&QScrollBar::valueChanged,this,[this,k](int){if(channel_>=0)sync(k);});
             connect(views_[k]->verticalScrollBar(),&QScrollBar::valueChanged,this,[this,k](int){if(channel_>=0)sync(k);});
         }
+        connect(grid,&QCheckBox::toggled,this,[this](bool on){for(int k=0;k<3;++k){views_[k]->gridEnabled=on;views_[k]->viewport()->update();}});
         layout->addLayout(panels,1);
         layout->addWidget(new QLabel(tr("Red: only A | Blue: only B | Orange: unequal nonzero | Gray: equal"),this));
         status_=new QLabel(this);layout->addWidget(status_);
