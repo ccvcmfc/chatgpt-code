@@ -87,7 +87,12 @@ class NpzCompareViewer : public QDialog {
         QString p=QFileDialog::getOpenFileName(this,tr("Open NPZ"),paths_[i]->text(),tr("NPZ files (*.npz);;All files (*)"));
         if (!p.isEmpty()) paths_[i]->setText(p);
     }
-    void compare() {
+    void compare(bool preserveView = false) {
+        const int oldChannel = channel_;
+        const QTransform oldTransform = views_[0]->transform();
+        const QPointF oldCenter = views_[0]->mapToScene(views_[0]->viewport()->rect().center());
+        const size_t oldWidth = a_ ? a_->width : 0;
+        const size_t oldHeight = a_ ? a_->height : 0;
         if(paths_[0]->text().isEmpty() || paths_[1]->text().isEmpty()) return;
         try {
             std::unique_ptr<NpzMask> a(new NpzMask(loadNpzMask(QFile::encodeName(paths_[0]->text()).constData())));
@@ -131,7 +136,20 @@ class NpzCompareViewer : public QDialog {
                 for(int j=0;j<cells.size();++j) table_->setItem(c,j,new QTableWidgetItem(cells[j]));
             }
             summary_->setText(tr("Channels: %1 | Identical: %2 | Different: %3").arg(table_->rowCount()).arg(table_->rowCount()-different).arg(different));
-            table_->selectRow(0); display(0);
+            const bool restore = preserveView && oldChannel >= 0 &&
+                oldChannel < table_->rowCount() && oldWidth == a_->width && oldHeight == a_->height;
+            const int selected = restore ? oldChannel : 0;
+            table_->setCurrentCell(selected,0);
+            table_->selectRow(selected);
+            display(selected);
+            if (restore) {
+                syncing_=true;
+                for(int k=0;k<3;++k) {
+                    views_[k]->setTransform(oldTransform);
+                    views_[k]->centerOn(oldCenter);
+                }
+                syncing_=false;
+            }
         } catch(const std::exception& e) {
             QMessageBox::warning(this,tr("Compare failed"),QString::fromLocal8Bit(e.what()));
         }
@@ -283,9 +301,12 @@ public:
         layout->addLayout(coordinates);
         auto* buttons=new QHBoxLayout;
         auto* run=new QPushButton(tr("Compare"),this);
+        auto* refresh=new QPushButton(tr("Refresh"),this);
+        refresh->setToolTip(tr("Reload both NPZ files from disk and compare again"));
+        refresh->setShortcut(QKeySequence(Qt::Key_F5));
         auto* full=new QPushButton(tr("Fit"),this);
         auto* diff=new QPushButton(tr("Fit Difference"),this);
-        buttons->addWidget(run);buttons->addWidget(full);buttons->addWidget(diff);
+        buttons->addWidget(run);buttons->addWidget(refresh);buttons->addWidget(full);buttons->addWidget(diff);
         layout->addLayout(buttons);
         summary_=new QLabel(this);layout->addWidget(summary_);
         table_=new QTableWidget(0,8,this);
@@ -318,6 +339,7 @@ public:
         layout->addWidget(new QLabel(tr("Red: only A | Blue: only B | Orange: unequal nonzero | Gray: equal"),this));
         status_=new QLabel(this);layout->addWidget(status_);
         connect(run,&QPushButton::clicked,this,[this](){compare();});
+        connect(refresh,&QPushButton::clicked,this,[this](){compare(true);});
         connect(full,&QPushButton::clicked,this,[this](){fit(false);});
         connect(diff,&QPushButton::clicked,this,[this](){fit(true);});
         connect(table_,&QTableWidget::currentCellChanged,this,[this](int r,int,int,int){display(r);});
