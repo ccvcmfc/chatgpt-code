@@ -16,11 +16,23 @@
 class NpzCompareGridView : public QGraphicsView {
 public:
     bool gridEnabled = true;
+    QPoint marker = QPoint(-1,-1);
     NpzCompareGridView(QGraphicsScene* scene, QWidget* parent)
         : QGraphicsView(scene, parent) {}
 protected:
     void drawForeground(QPainter* painter, const QRectF& exposed) override {
         QGraphicsView::drawForeground(painter, exposed);
+        if(marker.x()>=0 && marker.y()>=0) {
+            painter->save();
+            QPen mark(QColor(255,140,0)); mark.setCosmetic(true); mark.setWidth(2);
+            painter->setPen(mark); painter->setBrush(Qt::NoBrush);
+            painter->drawRect(QRectF(marker.x(),marker.y(),1,1));
+            const QPointF c=QPointF(marker)+QPointF(.5,.5);
+            const qreal arm=24.0/qMax(qreal(.0001),transform().m11());
+            painter->drawLine(QLineF(c.x()-arm,c.y(),c.x()+arm,c.y()));
+            painter->drawLine(QLineF(c.x(),c.y()-arm,c.x(),c.y()+arm));
+            painter->restore();
+        }
         if (!gridEnabled || transform().m11() < 8.0 || scene()->items().isEmpty()) return;
         const QRectF r = exposed.intersected(sceneRect());
         if (r.isEmpty()) return;
@@ -48,6 +60,10 @@ class NpzCompareViewer : public QDialog {
     QLabel* summary_;
     bool syncing_=false;
     int channel_=-1;
+    size_t diffIndex_=0;
+    quint64 diffOrdinal_=0;
+    QLabel* navStatus_=nullptr;
+    QCheckBox* diffOnly_=nullptr;
     std::vector<Stats> stats_;
     static bool valid(const NpzMask& m) {
         const size_t lim=std::numeric_limits<size_t>::max();
@@ -129,6 +145,35 @@ class NpzCompareViewer : public QDialog {
             QMessageBox::warning(this,tr("Compare failed"),QString::fromLocal8Bit(e.what()));
         }
     }
+    void navigateDiff(bool forward) {
+        if(!a_ || channel_<0 || !stats_[channel_].diff) return;
+        const size_t plane=a_->width*a_->height;
+        const auto* p=a_->pixels.data()+size_t(channel_)*plane;
+        const auto* q=b_->pixels.data()+size_t(channel_)*plane;
+        size_t i=diffOrdinal_ ? diffIndex_ : (forward?plane-1:0);
+        for(size_t n=0;n<plane;++n) {
+            i=forward?(i+1==plane?0:i+1):(i==0?plane-1:i-1);
+            if(p[i]!=q[i]) {
+                const quint64 total=stats_[channel_].diff;
+                diffOrdinal_=!diffOrdinal_?(forward?1:total):
+                    forward?(diffOrdinal_==total?1:diffOrdinal_+1):
+                    (diffOrdinal_==1?total:diffOrdinal_-1);
+                diffIndex_=i;
+                const QPoint pt(int(i%a_->width),int(i/a_->width));
+                syncing_=true;
+                for(int k=0;k<3;++k) {
+                    views_[k]->marker=pt;
+                    views_[k]->setTransform(QTransform::fromScale(20,20));
+                    views_[k]->centerOn(QPointF(pt)+QPointF(.5,.5));
+                    views_[k]->viewport()->update();
+                }
+                syncing_=false;
+                navStatus_->setText(tr("Diff %1 / %2 | Pixel (%3, %4) | A: %5 B: %6")
+                    .arg(diffOrdinal_).arg(total).arg(pt.x()).arg(pt.y()).arg(int(p[i])).arg(int(q[i])));
+                return;
+            }
+        }
+    }
     void display(int c) {
         if(!a_||c<0||size_t(c)>=a_->channels) return;
         int w=int(a_->width),h=int(a_->height);
@@ -144,15 +189,19 @@ class NpzCompareViewer : public QDialog {
                 for(int x=0;x<w;++x) {
                     size_t i=size_t(y)*w+x;
                     int v=p[i],u=q[i],g=255-(k==1?u:v);
-                    row[x]= k!=2||v==u ? qRgb(g,g,g) :
+                    row[x]= k==2 && diffOnly_->isChecked() && v==u ? qRgb(255,255,255) :
+                        k!=2||v==u ? qRgb(g,g,g) :
                         !u?qRgb(229,57,53):!v?qRgb(37,99,235):qRgb(245,158,11);
                 }
             }
             pix[k]=QPixmap::fromImage(img);
             if(pix[k].isNull()) {status_->setText(tr("Pixmap allocation failed"));return;}
         }
-        channel_=c; syncing_=true;
+        channel_=c; diffOrdinal_=0; diffIndex_=0;
+        navStatus_->setText(tr("Diff pixels: %1").arg(stats_[c].diff));
+        syncing_=true;
         for(int k=0;k<3;++k) {
+            views_[k]->marker=QPoint(-1,-1);
             scenes_[k]->clear(); scenes_[k]->addPixmap(pix[k]);
             scenes_[k]->setSceneRect(0,0,w,h);
         }
@@ -219,7 +268,7 @@ protected:
     }
 public:
     explicit NpzCompareViewer(QWidget* parent=nullptr):QDialog(parent) {
-        setWindowTitle(tr("NPZ Compare Viewer - Center / Grid / Refresh"));resize(1200,800);
+        setWindowTitle(tr("NPZ Compare Viewer - Diff Navigation"));resize(1200,800);
         auto* layout=new QVBoxLayout(this);
         for(int i=0;i<2;++i) {
             auto* row=new QHBoxLayout;
@@ -253,6 +302,24 @@ public:
         auto* diff=new QPushButton(tr("Fit Difference"),this);
         buttons->addWidget(run);buttons->addWidget(refresh);buttons->addWidget(full);buttons->addWidget(diff);
         layout->addLayout(buttons);
+        auto* nav=new QHBoxLayout;
+        auto* prev=new QPushButton(tr("Previous Diff"),this);
+        auto* next=new QPushButton(tr("Next Diff"),this);
+        diffOnly_=new QCheckBox(tr("Diff Only"),this);
+        navStatus_=new QLabel(tr("Diff pixels: -"),this);
+        nav->addWidget(prev);nav->addWidget(next);nav->addWidget(diffOnly_);
+        nav->addWidget(navStatus_,1);layout->addLayout(nav);
+        connect(prev,&QPushButton::clicked,this,[this](){navigateDiff(false);});
+        connect(next,&QPushButton::clicked,this,[this](){navigateDiff(true);});
+        connect(diffOnly_,&QCheckBox::toggled,this,[this](bool){
+            if(channel_<0) return;
+            const QTransform t=views_[0]->transform();
+            const QPointF center=views_[0]->mapToScene(views_[0]->viewport()->rect().center());
+            display(channel_);
+            syncing_=true;
+            for(int k=0;k<3;++k){views_[k]->setTransform(t);views_[k]->centerOn(center);}
+            syncing_=false;
+        });
         summary_=new QLabel(this);layout->addWidget(summary_);
         table_=new QTableWidget(0,8,this);
         table_->setHorizontalHeaderLabels(QStringList()<<"Channel"<<"Result"<<"Diff Pixels"<<"Diff (%)"<<"Only A"<<"Only B"<<"Other"<<"Max Diff");
