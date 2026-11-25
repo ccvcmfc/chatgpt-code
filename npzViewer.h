@@ -1,11 +1,18 @@
 // npzViewer.h
 // Qt 5.9 / C++11, header-only NPZ channel viewer.
-// Include after the declaration of NpzMask (or any compatible mask type).
+// Include after npzParser.h (NpzMask and loadNpzMask declarations).
 // qmake: QT += widgets
 #ifndef NPZ_VIEWER_H
 #define NPZ_VIEWER_H
 
 #include <QCheckBox>
+#include <QFileDialog>
+#include <QFile>
+#include <QLineEdit>
+#include <QMessageBox>
+#include <QSignalBlocker>
+#include <QTimer>
+#include <exception>
 #include <QComboBox>
 #include <QEvent>
 #include <QMouseEvent>
@@ -38,15 +45,18 @@
 template <typename Mask>
 class NpzChannelViewer : public QDialog {
 public:
+    explicit NpzChannelViewer(QWidget* parent = nullptr)
+        : NpzChannelViewer(std::shared_ptr<const Mask>(), nullptr, parent) {}
+
     explicit NpzChannelViewer(const Mask& mask, QWidget* parent = nullptr)
-        : NpzChannelViewer(std::shared_ptr<const Mask>(), mask, parent) {}
+        : NpzChannelViewer(std::shared_ptr<const Mask>(), &mask, parent) {}
 
     explicit NpzChannelViewer(std::shared_ptr<const Mask> mask,
                               QWidget* parent = nullptr)
-        : NpzChannelViewer(mask, *mask, parent) {}
+        : NpzChannelViewer(mask, mask.get(), parent) {}
 
 private:
-    NpzChannelViewer(std::shared_ptr<const Mask> ownedMask, const Mask& mask,
+    NpzChannelViewer(std::shared_ptr<const Mask> ownedMask, const Mask* mask,
                      QWidget* parent)
         : QDialog(parent), ownedMask_(std::move(ownedMask)), mask_(mask), scene_(new QGraphicsScene(this)),
           view_(new QGraphicsView(scene_, this)),
@@ -55,6 +65,18 @@ private:
         resize(900, 650);
 
         QVBoxLayout* layout = new QVBoxLayout(this);
+        QHBoxLayout* files = new QHBoxLayout();
+        path_ = new QLineEdit(this);
+        path_->setPlaceholderText(QStringLiteral("Select an NPZ file"));
+        QPushButton* browse = new QPushButton(QStringLiteral("Browse..."), this);
+        QPushButton* load = new QPushButton(QStringLiteral("Load"), this);
+        files->addWidget(path_, 1);
+        files->addWidget(browse);
+        files->addWidget(load);
+        layout->addLayout(files);
+        QObject::connect(browse, &QPushButton::clicked, this, [this]() { chooseFile(); });
+        QObject::connect(load, &QPushButton::clicked, this, [this]() { loadFile(path_->text()); });
+        QObject::connect(path_, &QLineEdit::returnPressed, this, [this]() { loadFile(path_->text()); });
         QHBoxLayout* controls = new QHBoxLayout();
         controls->addWidget(new QLabel(QStringLiteral("Channel:"), this));
         controls->addWidget(channels_, 1);
@@ -71,12 +93,6 @@ private:
         view_->viewport()->setMouseTracking(true);
         view_->viewport()->installEventFilter(this);
 
-        const size_t count = mask_.channels;
-        for (size_t i = 0; i < count && i < static_cast<size_t>(INT_MAX); ++i) {
-            QString label = QStringLiteral("Channel %1").arg(static_cast<qulonglong>(i));
-            channels_->addItem(label);
-        }
-
         QObject::connect(channels_,
                          static_cast<void (QComboBox::*)(int)>(&QComboBox::currentIndexChanged),
                          this, [this](int channel) { displayChannel(channel); });
@@ -89,26 +105,62 @@ private:
             displayChannel(channels_->currentIndex(), false);
         });
 
-        displayChannel(0);
+        refreshChannels();
+        if (!mask_)
+            QTimer::singleShot(0, this, [this]() { chooseFile(); });
+    }
+
+private:
+    void chooseFile() {
+        const QString file = QFileDialog::getOpenFileName(
+            this, QStringLiteral("Open NPZ"), path_->text(),
+            QStringLiteral("NPZ files (*.npz);;All files (*)"));
+        if (!file.isEmpty()) loadFile(file);
+    }
+
+    void loadFile(const QString& file) {
+        if (file.isEmpty()) return;
+        try {
+            std::shared_ptr<const Mask> next(
+                new Mask(loadNpzMask(QFile::encodeName(file).constData())));
+            ownedMask_ = std::move(next);
+            mask_ = ownedMask_.get();
+            path_->setText(file);
+            setWindowTitle(QStringLiteral("NPZ Channel Viewer - %1").arg(file));
+            refreshChannels();
+        } catch (const std::exception& e) {
+            QMessageBox::warning(this, QStringLiteral("NPZ load failed"),
+                                 QString::fromLocal8Bit(e.what()));
+        }
+    }
+
+    void refreshChannels() {
+        const QSignalBlocker blocker(channels_);
+        channels_->clear();
+        if (mask_) {
+            for (size_t i = 0; i < mask_->channels && i < static_cast<size_t>(INT_MAX); ++i)
+                channels_->addItem(QStringLiteral("Channel %1").arg(static_cast<qulonglong>(i)));
+        }
+        displayChannel(channels_->currentIndex());
     }
 
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override {
-        if (watched == view_->viewport()) {
+        if (watched == view_->viewport() && mask_) {
             if (event->type() == QEvent::MouseMove) {
                 QMouseEvent* mouse = static_cast<QMouseEvent*>(event);
                 const QPointF point = view_->mapToScene(mouse->pos());
                 const int channel = channels_->currentIndex();
                 if (channel >= 0 && point.x() >= 0 && point.y() >= 0 &&
-                    point.x() < static_cast<qreal>(mask_.width) &&
-                    point.y() < static_cast<qreal>(mask_.height)) {
+                    point.x() < static_cast<qreal>(mask_->width) &&
+                    point.y() < static_cast<qreal>(mask_->height)) {
                     const size_t x = static_cast<size_t>(point.x());
                     const size_t y = static_cast<size_t>(point.y());
                     const size_t offset =
-                        (static_cast<size_t>(channel) * mask_.height + y)
-                        * mask_.width + x;
-                    if (offset < mask_.pixels.size()) {
-                        const int value = mask_.pixels[offset];
+                        (static_cast<size_t>(channel) * mask_->height + y)
+                        * mask_->width + x;
+                    if (offset < mask_->pixels.size()) {
+                        const int value = mask_->pixels[offset];
                         status_->setText(
                             QStringLiteral("Channel %1 | X: %2 Y: %3 | Value: %4 | %5")
                             .arg(channel)
@@ -142,8 +194,13 @@ protected:
 private:
     void displayChannel(int channel, bool fit = true) {
         scene_->clear();
-        const size_t w = mask_.width, h = mask_.height;
-        if (channel < 0 || static_cast<size_t>(channel) >= mask_.channels ||
+        if (!mask_) {
+            scene_->setSceneRect(QRectF());
+            status_->setText(QStringLiteral("Select an NPZ file"));
+            return;
+        }
+        const size_t w = mask_->width, h = mask_->height;
+        if (channel < 0 || static_cast<size_t>(channel) >= mask_->channels ||
             !w || !h || w > static_cast<size_t>(INT_MAX) ||
             h > static_cast<size_t>(INT_MAX) ||
             w > std::numeric_limits<size_t>::max() / h) {
@@ -151,15 +208,15 @@ private:
             return;
         }
         const size_t plane = w * h;
-        if (mask_.channels > std::numeric_limits<size_t>::max() / plane ||
-            mask_.pixels.size() < mask_.channels * plane) {
+        if (mask_->channels > std::numeric_limits<size_t>::max() / plane ||
+            mask_->pixels.size() < mask_->channels * plane) {
             status_->setText(QStringLiteral("Invalid NPZ pixel buffer size"));
             return;
         }
 
         // QImage borrows the mask buffer; QPixmap::fromImage makes a display copy.
         const uchar* data = reinterpret_cast<const uchar*>(
-            mask_.pixels.data() + static_cast<size_t>(channel) * plane);
+            mask_->pixels.data() + static_cast<size_t>(channel) * plane);
         QImage image(data, static_cast<int>(w), static_cast<int>(h),
                      static_cast<int>(w), QImage::Format_Indexed8);
         if (image.isNull()) {
@@ -192,7 +249,8 @@ private:
     }
 
     std::shared_ptr<const Mask> ownedMask_;
-    const Mask& mask_;
+    const Mask* mask_;
+    QLineEdit* path_;
     QGraphicsScene* scene_;
     QGraphicsView* view_;
     QComboBox* channels_;
@@ -218,6 +276,15 @@ inline NpzChannelViewer<Mask>* showNpzViewerMulti(
     Mask mask, QWidget* parent = nullptr) {
     std::shared_ptr<const Mask> owned(new Mask(std::move(mask)));
     NpzChannelViewer<Mask>* viewer = new NpzChannelViewer<Mask>(owned, parent);
+    viewer->setAttribute(Qt::WA_DeleteOnClose);
+    viewer->setWindowFlag(Qt::Window, true);
+    viewer->show();
+    return viewer;
+}
+
+// Open an empty non-modal viewer; the file dialog opens automatically.
+inline NpzChannelViewer<NpzMask>* showNpzViewerMulti(QWidget* parent = nullptr) {
+    NpzChannelViewer<NpzMask>* viewer = new NpzChannelViewer<NpzMask>(parent);
     viewer->setAttribute(Qt::WA_DeleteOnClose);
     viewer->setWindowFlag(Qt::Window, true);
     viewer->show();
