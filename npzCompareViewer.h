@@ -7,6 +7,7 @@
 #include <limits>
 #include <exception>
 #include <algorithm>
+#include <cmath>
 #include <climits>
 #include <cstdlib>
 #include <stdexcept>
@@ -34,6 +35,28 @@ protected:
         for (qreal y=std::ceil(r.top());y<=r.bottom();y+=1.0)
             p->drawLine(QLineF(r.left(),y,r.right(),y));
         p->restore();
+    }
+};
+
+class NpzCompareGridView : public QGraphicsView {
+public:
+    bool gridEnabled = true;
+    NpzCompareGridView(QGraphicsScene* scene, QWidget* parent)
+        : QGraphicsView(scene, parent) {}
+protected:
+    void drawForeground(QPainter* painter, const QRectF& exposed) override {
+        QGraphicsView::drawForeground(painter, exposed);
+        if (!gridEnabled || transform().m11() < 8.0 || scene()->items().isEmpty()) return;
+        const QRectF r = exposed.intersected(sceneRect());
+        if (r.isEmpty()) return;
+        QPen pen(QColor(128,128,128,150));
+        pen.setCosmetic(true); pen.setWidth(0);
+        painter->save(); painter->setPen(pen);
+        for (qreal x=std::ceil(r.left()); x<=r.right(); x+=1)
+            painter->drawLine(QLineF(x,r.top(),x,r.bottom()));
+        for (qreal y=std::ceil(r.top()); y<=r.bottom(); y+=1)
+            painter->drawLine(QLineF(r.left(),y,r.right(),y));
+        painter->restore();
     }
 };
 
@@ -171,13 +194,31 @@ protected:
                 }
                 return true;
             }
+            if(e->type()==QEvent::Leave) QToolTip::hideText();
             if(e->type()==QEvent::MouseMove) {
                 QPointF p=views_[k]->mapToScene(static_cast<QMouseEvent*>(e)->pos());
                 if(p.x()>=0&&p.y()>=0&&p.x()<a_->width&&p.y()<a_->height) {
                     size_t x=size_t(p.x()),y=size_t(p.y());
                     size_t i=(size_t(channel_)*a_->height+y)*a_->width+x;
                     int v=a_->pixels[i],u=b_->pixels[i];
-                    status_->setText(tr("X: %1 Y: %2 | A: %3 B: %4 | A-B: %5").arg(qulonglong(x)).arg(qulonglong(y)).arg(v).arg(u).arg(v-u));
+                    QString msg=tr("X: %1 Y: %2 | A: %3 B: %4 | A-B: %5").arg(qulonglong(x)).arg(qulonglong(y)).arg(v).arg(u).arg(v-u);
+                    bool ok[4];
+                    double sx=coords_[0]->text().toDouble(&ok[0]);
+                    double sy=coords_[1]->text().toDouble(&ok[1]);
+                    double size=coords_[2]->text().toDouble(&ok[2]);
+                    double pitch=coords_[3]->text().toDouble(&ok[3]);
+                    if(ok[0]&&ok[1]&&ok[2]&&ok[3]&&std::isfinite(sx)&&std::isfinite(sy)&&std::isfinite(size)&&std::isfinite(pitch)&&size>0&&pitch>0) {
+                        double ux=sx+double(x)*pitch;
+                        double uy=sy+double(a_->height-1-y)*pitch;
+                        msg+=tr(" | um: (%1, %2)").arg(ux,0,'f',9).arg(uy,0,'f',9);
+                        if(std::abs(size-double(a_->width)*pitch)>pitch*1e-6 ||
+                           std::abs(size-double(a_->height)*pitch)>pitch*1e-6)
+                            msg+=tr(" | Size differs from image extent");
+                    }
+                    status_->setText(msg);
+                    QToolTip::showText(static_cast<QMouseEvent*>(e)->globalPos(),msg,views_[k]->viewport());
+                } else {
+                    QToolTip::hideText();
                     bool ok[4]; double d[4];
                     for(int j=0;j<4;++j) d[j]=coord_[j]->text().toDouble(&ok[j]);
                     bool validCoords=true;
@@ -227,6 +268,19 @@ public:
         layout->addLayout(coordinates);
         coordStatus_=new QLabel(tr("Enter center X/Y, size and um_per_pixel"),this);
         layout->addWidget(coordStatus_);
+        auto* coordinates=new QHBoxLayout;
+        const char* names[]={"Start X (um)","Start Y (um)","Size (um)","um_per_pixel"};
+        for(int i=0;i<4;++i) {
+            coordinates->addWidget(new QLabel(QString::fromLatin1(names[i]),this));
+            coords_[i]=new QLineEdit(this);
+            coords_[i]->setMaximumWidth(120);
+            coords_[i]->setPlaceholderText(i<2?"0.0":"Required");
+            if(i<2) coords_[i]->setText("0");
+            coordinates->addWidget(coords_[i]);
+        }
+        grid_=new QCheckBox(tr("Show Grid"),this);
+        grid_->setChecked(true);coordinates->addWidget(grid_);
+        layout->addLayout(coordinates);
         auto* buttons=new QHBoxLayout;
         auto* run=new QPushButton(tr("Compare"),this);
         auto* full=new QPushButton(tr("Fit"),this);
@@ -257,6 +311,9 @@ public:
             connect(views_[k]->verticalScrollBar(),&QScrollBar::valueChanged,this,[this,k](int){if(channel_>=0)sync(k);});
         }
         connect(grid,&QCheckBox::toggled,this,[this](bool on){for(int k=0;k<3;++k){views_[k]->gridEnabled=on;views_[k]->viewport()->update();}});
+        connect(grid_,&QCheckBox::toggled,this,[this](bool on){
+            for(int k=0;k<3;++k) {views_[k]->gridEnabled=on;views_[k]->viewport()->update();}
+        });
         layout->addLayout(panels,1);
         layout->addWidget(new QLabel(tr("Red: only A | Blue: only B | Orange: unequal nonzero | Gray: equal"),this));
         status_=new QLabel(this);layout->addWidget(status_);
