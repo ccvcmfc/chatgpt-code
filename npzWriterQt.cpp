@@ -1,4 +1,6 @@
-#include "npzWriterQt.h"
+#include <QImage>
+#include <QString>
+#include <memory>
 #include <QSaveFile>
 #include <QByteArray>
 #include <QtEndian>
@@ -7,19 +9,20 @@
 #include <cstring>
 #include <new>
 
-namespace {
-const quint64 Limit = 0xffffffffULL; // reserved ZIP64 sentinel
-const int LocalSize = 38; // 30 + strlen("data.npy")
-const int CentralSize = 54;
-const int EndSize = 22;
-const quint64 MaxCompressed = Limit - 1 - LocalSize - CentralSize - EndSize;
-void le16(QByteArray& b, int i, quint16 v) {
+class NpzWriter {
+private:
+static constexpr quint64 Limit = 0xffffffffULL; // reserved ZIP64 sentinel
+static constexpr int LocalSize = 38; // 30 + strlen("data.npy")
+static constexpr int CentralSize = 54;
+static constexpr int EndSize = 22;
+static constexpr quint64 MaxCompressed = Limit - 1 - LocalSize - CentralSize - EndSize;
+static void le16(QByteArray& b, int i, quint16 v) {
     qToLittleEndian<quint16>(v, reinterpret_cast<uchar*>(b.data()+i));
 }
-void le32(QByteArray& b, int i, quint32 v) {
+static void le32(QByteArray& b, int i, quint32 v) {
     qToLittleEndian<quint32>(v, reinterpret_cast<uchar*>(b.data()+i));
 }
-bool writeAll(QSaveFile& f, const char* p, qint64 n) {
+static bool writeAll(QSaveFile& f, const char* p, qint64 n) {
     while (n > 0) {
         const qint64 k = f.write(p,n);
         if (k <= 0) return false;
@@ -27,7 +30,7 @@ bool writeAll(QSaveFile& f, const char* p, qint64 n) {
     }
     return true;
 }
-QByteArray npyHeader(int c,int h,int w) {
+static QByteArray npyHeader(int c,int h,int w) {
     QByteArray d = "{'descr': '|u1', 'fortran_order': False, 'shape': (" +
         QByteArray::number(c) + ", " + QByteArray::number(h) + ", " +
         QByteArray::number(w) + "), }";
@@ -39,9 +42,8 @@ QByteArray npyHeader(int c,int h,int w) {
     b.append(d);
     return b;
 }
-}
 
-struct NpzWriter::State {
+struct State {
     QSaveFile file;
     z_stream z;
     bool initialized;
@@ -83,11 +85,15 @@ struct NpzWriter::State {
     }
 };
 
-NpzWriter::NpzWriter() {}
-NpzWriter::~NpzWriter() { cancel(); }
-void NpzWriter::cancel() { s_.reset(); }
+std::unique_ptr<State> s_;
+public:
+NpzWriter() = default;
+~NpzWriter() { cancel(); }
+NpzWriter(const NpzWriter&) = delete;
+NpzWriter& operator=(const NpzWriter&) = delete;
+void cancel() { s_.reset(); }
 
-int NpzWriter::begin(const QString& path,int channels,int height,int width) {
+int begin(const QString& path,int channels,int height,int width) {
     cancel();
     if (path.isEmpty() || channels<=0 || height<=0 || width<=0) return -1;
     try {
@@ -114,7 +120,7 @@ int NpzWriter::begin(const QString& path,int channels,int height,int width) {
     } catch (const std::bad_alloc&) { cancel(); return -7; }
 }
 
-int NpzWriter::append(const QImage& image) {
+int append(const QImage& image, bool saveAA = false) {
     if (!s_) return -1;
     if (image.isNull() || image.format()!=QImage::Format_RGB32 ||
         image.width()!=s_->w || image.height()!=s_->h || s_->count>=s_->c) {
@@ -124,8 +130,13 @@ int NpzWriter::append(const QImage& image) {
         const QRgb* src=reinterpret_cast<const QRgb*>(image.constScanLine(y));
         for (int x=0;x<s_->w;) {
             const int n=std::min(65536,s_->w-x);
-            for (int i=0;i<n;++i)
-                s_->row[i]=(src[x+i]&0x00ffffffU) ? 255 : 0;
+            if (saveAA) {
+                for (int i=0;i<n;++i)
+                    s_->row[i]=static_cast<unsigned char>(qRed(src[x+i]));
+            } else {
+                for (int i=0;i<n;++i)
+                    s_->row[i]=(src[x+i]&0x00ffffffU) ? 255 : 0;
+            }
             const int rc=s_->feed(s_->row,static_cast<unsigned int>(n));
             if (rc) { cancel(); return rc; }
             x+=n;
@@ -135,7 +146,7 @@ int NpzWriter::append(const QImage& image) {
     return 0;
 }
 
-int NpzWriter::end() {
+int end() {
     if (!s_) return -1;
     if (s_->count!=s_->c) { cancel(); return -1; }
     try {
@@ -166,5 +177,6 @@ int NpzWriter::end() {
         return ok ? 0 : -5;
     } catch (const std::bad_alloc&) { cancel(); return -7; }
 }
+};
 // 0 success; -1 invalid input/state; -2 ZIP32 overflow;
 // -4 compression; -5 file I/O; -7 allocation.
